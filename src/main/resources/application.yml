@@ -1,0 +1,6 @@
+spring:
+  application:
+    name: QueueForge
+
+server:
+  port: 8888
