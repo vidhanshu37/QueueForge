@@ -1,44 +1,47 @@
 package com.pr_reviewer.queueforge.broker;
-import java.io.File;
-import java.io.IOException;
+
+import java.io.*;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.*;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
 
 public class Partition {
 
     private final String partitionDir;
     private final int maxMessagesPerSegment = 1000;
     private final int maxSegments = 5;
+    private final int indexInterval = 100;
+
+    private static final int INDEX_RECORD_SIZE = 16;
 
     private final TreeMap<Long, Integer> segmentMessageCounts = new TreeMap<>();
-
-    private final Map<Long, Map<Long, Long>> loadedIndexes = new HashMap<>();
-    private final Map<Long, FileChannel> openChannels = new HashMap<>();
+    private final Map<Long, FileChannel> logChannels = new HashMap<>();
+    private final Map<Long, FileChannel> indexChannels = new HashMap<>();
 
     private long activeSegmentStartOffset;
-    private FileChannel activeChannel;
+    private FileChannel activeLogChannel;
+    private FileChannel activeIndexChannel;
     private long activeWritePosition;
     private int messagesInActiveSegment;
     private long nextOffset = 0;
-
 
     public Partition(String partitionDir) throws IOException {
         this.partitionDir = partitionDir;
         Files.createDirectories(Paths.get(partitionDir));
 
         if (loadMetadata()) {
-            // start from metadata, load the last segment
             activeSegmentStartOffset = segmentMessageCounts.lastKey();
             messagesInActiveSegment = segmentMessageCounts.get(activeSegmentStartOffset);
             nextOffset = activeSegmentStartOffset + messagesInActiveSegment;
-            activeChannel = openChannel(activeSegmentStartOffset);
-            activeWritePosition = activeChannel.size();
-            System.out.println("Loaded partition from metadata: " + segmentMessageCounts.size() + " segments, nextOffset=" + nextOffset);
+
+            activeLogChannel = openLogChannel(activeSegmentStartOffset);
+            activeIndexChannel = openIndexChannel(activeSegmentStartOffset);
+            activeWritePosition = activeLogChannel.size();
+
+            System.out.println("Loaded partition from metadata: " + segmentMessageCounts.size() +
+                    " segments, nextOffset=" + nextOffset);
         } else {
-            // for new segment
             startNewSegment(0);
             saveMetadata();
         }
@@ -51,24 +54,21 @@ public class Partition {
     private boolean loadMetadata() {
         Path path = metadataPath();
         if (!Files.exists(path)) return false;
-
         try {
             String content = new String(Files.readAllBytes(path), "UTF-8");
             if (content.isBlank()) return false;
-
             for (String entry : content.trim().split(",")) {
                 String[] parts = entry.split(":");
-                long start = Long.parseLong(parts[0]);
-                int count = Integer.parseInt(parts[1]);
-                segmentMessageCounts.put(start, count);
+                segmentMessageCounts.put(Long.parseLong(parts[0]), Integer.parseInt(parts[1]));
             }
             return !segmentMessageCounts.isEmpty();
         } catch (Exception e) {
-            System.out.println("Metadata corrupt/unreadable, falling back to fresh state: " + e.getMessage());
+            System.out.println("Metadata corrupt/unreadable, starting fresh: " + e.getMessage());
             segmentMessageCounts.clear();
             return false;
         }
     }
+
 
     private void saveMetadata() throws IOException {
         StringBuilder sb = new StringBuilder();
@@ -76,27 +76,40 @@ public class Partition {
             if (sb.length() > 0) sb.append(",");
             sb.append(e.getKey()).append(":").append(e.getValue());
         }
-
         Path tempFile = Paths.get(partitionDir, "metadata.tmp");
         Files.write(tempFile, sb.toString().getBytes("UTF-8"));
         Files.move(tempFile, metadataPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
     }
 
-    private String segmentPath(long startOffset) {
+    private String logPath(long startOffset) {
         return partitionDir + "/segment-" + startOffset + ".log";
     }
 
-    private FileChannel openChannel(long startOffset) throws IOException {
-        if (openChannels.containsKey(startOffset)) {
-            return openChannels.get(startOffset);
-        }
-        FileChannel channel = FileChannel.open(Paths.get(segmentPath(startOffset)), StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE);
-        openChannels.put(startOffset, channel);
-        return channel;
+    private String indexPath(long startOffset) {
+        return partitionDir + "/segment-" + startOffset + ".index";
+    }
+
+    private FileChannel openLogChannel(long startOffset) throws IOException {
+        return logChannels.computeIfAbsent(startOffset, s -> {
+            try {
+                return FileChannel.open(Paths.get(logPath(s)),
+                        StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE);
+            } catch (IOException e) { throw new RuntimeException(e); }
+        });
+    }
+
+    private FileChannel openIndexChannel(long startOffset) throws IOException {
+        return indexChannels.computeIfAbsent(startOffset, s -> {
+            try {
+                return FileChannel.open(Paths.get(indexPath(s)),
+                        StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE);
+            } catch (IOException e) { throw new RuntimeException(e); }
+        });
     }
 
     private void startNewSegment(long startOffset) throws IOException {
-        activeChannel = openChannel(startOffset);
+        activeLogChannel = openLogChannel(startOffset);
+        activeIndexChannel = openIndexChannel(startOffset);
         segmentMessageCounts.put(startOffset, 0);
 
         activeSegmentStartOffset = startOffset;
@@ -104,33 +117,40 @@ public class Partition {
         messagesInActiveSegment = 0;
     }
 
-    private Map<Long, Long> loadIndexForSegment(long segStart) throws IOException {
-        if (loadedIndexes.containsKey(segStart)) {
-            return loadedIndexes.get(segStart);
+    private void appendIndexEntry(FileChannel indexChannel, long offset, long position) throws IOException {
+        ByteBuffer buf = ByteBuffer.allocate(INDEX_RECORD_SIZE);
+        buf.putLong(offset);
+        buf.putLong(position);
+        buf.flip();
+        indexChannel.position(indexChannel.size());
+        indexChannel.write(buf);
+    }
+
+    private long[] binarySearchFloor(FileChannel indexChannel, long targetOffset) throws IOException {
+        long numEntries = indexChannel.size() / INDEX_RECORD_SIZE;
+        if (numEntries == 0) return null;
+
+        long lo = 0, hi = numEntries - 1;
+        long[] result = null;
+        ByteBuffer buf = ByteBuffer.allocate(INDEX_RECORD_SIZE);
+
+        while (lo <= hi) {
+            long mid = (lo + hi) / 2;
+            buf.clear();
+            indexChannel.position(mid * INDEX_RECORD_SIZE);
+            indexChannel.read(buf);
+            buf.flip();
+            long entryOffset = buf.getLong();
+            long entryPosition = buf.getLong();
+
+            if (entryOffset <= targetOffset) {
+                result = new long[]{entryOffset, entryPosition};
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
         }
-
-        FileChannel channel = openChannel(segStart);
-        Map<Long, Long> offsetToPosition = new HashMap<>();
-
-        long position = 0;
-        long fileSize = channel.size();
-        long offset = segStart;
-        ByteBuffer lengthBuf = ByteBuffer.allocate(4);
-
-        while (position < fileSize) {
-            channel.position(position);
-            lengthBuf.clear();
-            channel.read(lengthBuf);
-            lengthBuf.flip();
-            int length = lengthBuf.getInt();
-
-            offsetToPosition.put(offset, position);
-            position += 4 + length;
-            offset++;
-        }
-
-        loadedIndexes.put(segStart, offsetToPosition);
-        return offsetToPosition;
+        return result;
     }
 
     public synchronized long append(byte[] value) throws IOException {
@@ -139,18 +159,21 @@ public class Partition {
             enforceRetention();
         }
 
+        long offset = nextOffset;
+        long position = activeWritePosition;
+
         ByteBuffer buffer = ByteBuffer.allocate(4 + value.length);
         buffer.putInt(value.length);
         buffer.put(value);
         buffer.flip();
 
-        activeChannel.position(activeWritePosition);
-        activeChannel.write(buffer);
+        activeLogChannel.position(position);
+        activeLogChannel.write(buffer);
 
-        long offset = nextOffset;
-
-        loadedIndexes.computeIfAbsent(activeSegmentStartOffset, k -> new HashMap<>())
-                .put(offset, activeWritePosition);
+        long relativeCount = offset - activeSegmentStartOffset;
+        if (relativeCount % indexInterval == 0) {
+            appendIndexEntry(activeIndexChannel, offset, position);
+        }
 
         activeWritePosition += 4 + value.length;
         messagesInActiveSegment++;
@@ -162,24 +185,45 @@ public class Partition {
         return offset;
     }
 
-    public synchronized byte[] read(long offset) throws IOException {
-        Long segStart = segmentMessageCounts.floorKey(offset);
+    public synchronized byte[] read(long targetOffset) throws IOException {
+        Long segStart = segmentMessageCounts.floorKey(targetOffset);
         if (segStart == null) return null;
 
-        Map<Long, Long> offsetToPosition = loadIndexForSegment(segStart);
-        Long position = offsetToPosition.get(offset);
-        if (position == null) return null;
+        FileChannel logChannel = openLogChannel(segStart);
+        FileChannel indexChannel = openIndexChannel(segStart);
 
-        FileChannel channel = openChannel(segStart);
-        channel.position(position);
+        long[] floorEntry = binarySearchFloor(indexChannel, targetOffset);
+
+        long scanOffset;
+        long scanPosition;
+        if (floorEntry == null) {
+            scanOffset = segStart;
+            scanPosition = 0;
+        } else {
+            scanOffset = floorEntry[0];
+            scanPosition = floorEntry[1];
+        }
 
         ByteBuffer lengthBuf = ByteBuffer.allocate(4);
-        channel.read(lengthBuf);
+        while (scanOffset < targetOffset) {
+            logChannel.position(scanPosition);
+            lengthBuf.clear();
+            logChannel.read(lengthBuf);
+            lengthBuf.flip();
+            int length = lengthBuf.getInt();
+
+            scanPosition += 4 + length;
+            scanOffset++;
+        }
+
+        logChannel.position(scanPosition);
+        lengthBuf.clear();
+        logChannel.read(lengthBuf);
         lengthBuf.flip();
         int length = lengthBuf.getInt();
 
         ByteBuffer valueBuf = ByteBuffer.allocate(length);
-        channel.read(valueBuf);
+        logChannel.read(valueBuf);
         valueBuf.flip();
 
         byte[] value = new byte[length];
@@ -191,11 +235,13 @@ public class Partition {
         while (segmentMessageCounts.size() > maxSegments) {
             long oldestStart = segmentMessageCounts.firstKey();
 
-            FileChannel channel = openChannels.remove(oldestStart);
-            if (channel != null) channel.close();
-            loadedIndexes.remove(oldestStart);
+            FileChannel logCh = logChannels.remove(oldestStart);
+            if (logCh != null) logCh.close();
+            FileChannel idxCh = indexChannels.remove(oldestStart);
+            if (idxCh != null) idxCh.close();
 
-            Files.deleteIfExists(Paths.get(segmentPath(oldestStart)));
+            Files.deleteIfExists(Paths.get(logPath(oldestStart)));
+            Files.deleteIfExists(Paths.get(indexPath(oldestStart)));
             segmentMessageCounts.remove(oldestStart);
 
             System.out.println("Deleted old segment starting at offset " + oldestStart);
@@ -208,13 +254,7 @@ public class Partition {
     }
 
     public void close() throws IOException {
-        for (FileChannel ch : openChannels.values()) {
-            ch.close();
-        }
+        for (FileChannel ch : logChannels.values()) ch.close();
+        for (FileChannel ch : indexChannels.values()) ch.close();
     }
-
-
-
-
-
 }
