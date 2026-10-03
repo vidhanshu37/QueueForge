@@ -64,7 +64,7 @@ public class ConsumerClient {
         ConsumerClient consumer = new ConsumerClient("localhost", 9092);
         consumer.connect();
 
-        consumer.pollLoop("orders", 1, 0, 2);
+        consumer.pollLoop("orders", 1, 0, 3);
 
         consumer.close();
     }

@@ -1,6 +1,10 @@
 HELP.md
 target/
 .mvn/wrapper/maven-wrapper.jar
+
+data/
+src/main/java/com/pr_reviewer/queueforge/test/
+
 !**/src/main/**/target/
 !**/src/test/**/target/
 
