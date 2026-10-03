@@ -24,8 +24,15 @@ public class BrokerServer {
     private List<Partition> getOrCreatePartitions(String topic) {
         return topicPartitions.computeIfAbsent(topic, t -> {
             List<Partition> partitions = new ArrayList<>();
+            new File("data").mkdirs();
+
             for (int i = 0; i < numPartitionPerTopic; i++) {
-                partitions.add(new Partition());
+                try {
+                    String logPath = "data/" + topic + "-" + i + ".log";
+                    partitions.add(new Partition(logPath));
+                } catch (IOException e) {
+                    throw new RuntimeException("Failed to create partition log file for " + topic + "-" + i, e);
+                }
             }
             return partitions;
         });
@@ -89,7 +96,7 @@ public class BrokerServer {
         }
     }
 
-    private FetchResponse handleFetch(FetchRequest req) {
+    private FetchResponse handleFetch(FetchRequest req) throws IOException {
         List<Partition> partitions = getOrCreatePartitions(req.topic);
         if (req.partition < 0 || req.partition >= partitions.size()) {
             return new FetchResponse(false, null, -1);
@@ -102,7 +109,7 @@ public class BrokerServer {
         return new FetchResponse(true, value, req.offset + 1);
     }
 
-    private void handleProduce(ProduceRequest req) {
+    private void handleProduce(ProduceRequest req) throws IOException {
         List<Partition> partitions = getOrCreatePartitions(req.topic);
         int targetPartition = selectPartition(req.topic, req.partition, req.key);
         long offset = partitions.get(targetPartition).append(req.value);
