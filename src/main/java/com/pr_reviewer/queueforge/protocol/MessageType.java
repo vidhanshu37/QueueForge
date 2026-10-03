@@ -4,7 +4,9 @@ public enum MessageType {
     PRODUCE(1),
     FETCH(2),
     PRODUCE_RESPONSE(3),
-    FETCH_RESPONSE(4);
+    FETCH_RESPONSE(4),
+    REPLICATE(5),
+    REPLICATE_RESPONSE(6);
 
     private final int code;
 
