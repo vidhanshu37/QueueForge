@@ -50,8 +50,10 @@ public class ProducerClient {
 
         producer.send("orders", -1, "user123".getBytes("UTF-8"), "msg-A".getBytes("UTF-8"));
         producer.send("orders", -1, "user123".getBytes("UTF-8"), "msg-B".getBytes("UTF-8"));
-        producer.send("orders", -1, "user001".getBytes("UTF-8"), "msg-C".getBytes("UTF-8"));
-        producer.send("orders", -1, "user001".getBytes("UTF-8"), "msg-x".getBytes("UTF-8"));
+        producer.send("orders", -1, "user001".getBytes("UTF-8"), "msg-1".getBytes("UTF-8"));
+        producer.send("orders", -1, "user001".getBytes("UTF-8"), "msg-2".getBytes("UTF-8"));
+        producer.send("orders", -1, "user001".getBytes("UTF-8"), "msg-3".getBytes("UTF-8"));
+        producer.send("orders", -1, "user001".getBytes("UTF-8"), "msg-4".getBytes("UTF-8"));
         producer.send("orders", -1, "user002".getBytes("UTF-8"), "msg-D".getBytes("UTF-8"));
         producer.close();
     }

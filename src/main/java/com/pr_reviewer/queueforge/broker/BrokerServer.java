@@ -28,10 +28,10 @@ public class BrokerServer {
 
             for (int i = 0; i < numPartitionPerTopic; i++) {
                 try {
-                    String logPath = "data/" + topic + "-" + i + ".log";
-                    partitions.add(new Partition(logPath));
+                    String partitionDir = "data/" + topic + "-" + i;
+                    partitions.add(new Partition(partitionDir));
                 } catch (IOException e) {
-                    throw new RuntimeException("Failed to create partition log file for " + topic + "-" + i, e);
+                    throw new RuntimeException("Failed to create partition dir for " + topic + "-" + i, e);
                 }
             }
             return partitions;
