@@ -7,58 +7,61 @@ public class ProduceRequest {
     public final int partition;
     public final byte[] key;
     public final byte[] value;
+    public final int ack; // 0, 1, ya -1 (all)
 
-    public ProduceRequest(String topic, int partition, byte[] key, byte[] value) {
+    public ProduceRequest(String topic, int partition, byte[] key, byte[] value, int ack) {
         this.topic = topic;
         this.partition = partition;
         this.key = key;
         this.value = value;
+        this.ack = ack;
     }
 
     public byte[] encode() throws IOException {
-        ByteArrayOutputStream arrOut = new ByteArrayOutputStream();
-        DataOutputStream dataOut = new DataOutputStream(arrOut);
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        DataOutputStream out = new DataOutputStream(baos);
 
         byte[] topicBytes = topic.getBytes("UTF-8");
-        dataOut.writeInt(topicBytes.length);
-        dataOut.write(topicBytes);
-        dataOut.writeInt(partition);
+        out.writeInt(topicBytes.length);
+        out.write(topicBytes);
+        out.writeInt(partition);
 
-        if(key == null) {
-            dataOut.writeInt(-1);
+        if (key == null) {
+            out.writeInt(-1);
         } else {
-            dataOut.writeInt(key.length);
-            dataOut.write(key);
+            out.writeInt(key.length);
+            out.write(key);
         }
 
-        dataOut.writeInt(value.length);
-        dataOut.write(value);
+        out.writeInt(value.length);
+        out.write(value);
+        out.writeInt(ack);
 
-        return arrOut.toByteArray();
+        return baos.toByteArray();
     }
 
     public static ProduceRequest decode(byte[] payload) throws IOException {
-        DataInputStream dataIn = new DataInputStream(new ByteArrayInputStream(payload));
+        DataInputStream in = new DataInputStream(new ByteArrayInputStream(payload));
 
-        int topicLength = dataIn.readInt();
-        byte[] topicBytes = new byte[topicLength];
-        dataIn.readFully(topicBytes);
+        int topicLen = in.readInt();
+        byte[] topicBytes = new byte[topicLen];
+        in.readFully(topicBytes);
         String topic = new String(topicBytes, "UTF-8");
 
-        int partition = dataIn.readInt();
+        int partition = in.readInt();
 
-        int keyLength = dataIn.readInt();
+        int keyLen = in.readInt();
         byte[] key = null;
-
-        if(keyLength >= 0 ) {
-            key = new byte[keyLength];
-            dataIn.readFully(key);
+        if (keyLen >= 0) {
+            key = new byte[keyLen];
+            in.readFully(key);
         }
 
-        int valueLength = dataIn.readInt();
-        byte[] value = new byte[valueLength];
-        dataIn.readFully(value);
+        int valueLen = in.readInt();
+        byte[] value = new byte[valueLen];
+        in.readFully(value);
+        int ack = in.readInt();
 
-        return  new ProduceRequest(topic, partition, key, value);
+        return new ProduceRequest(topic, partition, key, value, ack);
     }
 }

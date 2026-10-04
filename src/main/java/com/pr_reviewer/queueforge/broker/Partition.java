@@ -186,6 +186,10 @@ public class Partition {
     }
 
     public synchronized byte[] read(long targetOffset) throws IOException {
+        if (targetOffset < 0 || targetOffset >= nextOffset) {
+            return null;
+        }
+
         Long segStart = segmentMessageCounts.floorKey(targetOffset);
         if (segStart == null) return null;
 

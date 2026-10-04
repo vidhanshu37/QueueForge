@@ -28,9 +28,9 @@ public class ProducerClient {
         System.out.println("Connected to broker at " + host + ":" + port);
     }
 
-    public void send(String topic, int partition, byte[] key, byte[] value) throws IOException {
-        ProduceRequest request = new ProduceRequest(topic, partition, key, value);
-        byte[] payload = request.encode();
+    public void send(String topic, int partition, byte[] key, byte[] value, int ack) throws IOException {
+        ProduceRequest req = new ProduceRequest(topic, partition, key, value, ack);
+        byte[] payload = req.encode();
         Frame frame = new Frame(MessageType.PRODUCE, payload);
 
         frame.writeTo(out);
@@ -48,13 +48,13 @@ public class ProducerClient {
         ProducerClient producer = new ProducerClient("localhost", 9092);
         producer.connect();
 
-        producer.send("orders", -1, "user123".getBytes("UTF-8"), "msg-A".getBytes("UTF-8"));
-        producer.send("orders", -1, "user123".getBytes("UTF-8"), "msg-B".getBytes("UTF-8"));
-        producer.send("orders", -1, "user001".getBytes("UTF-8"), "msg-1".getBytes("UTF-8"));
-        producer.send("orders", -1, "user001".getBytes("UTF-8"), "msg-2".getBytes("UTF-8"));
-        producer.send("orders", -1, "user001".getBytes("UTF-8"), "msg-3".getBytes("UTF-8"));
-        producer.send("orders", -1, "user001".getBytes("UTF-8"), "msg-4".getBytes("UTF-8"));
-        producer.send("orders", -1, "user002".getBytes("UTF-8"), "msg-D".getBytes("UTF-8"));
+        producer.send("orders", -1, "user123".getBytes("UTF-8"), "msg-A".getBytes("UTF-8"), 0);
+        producer.send("orders", -1, "user123".getBytes("UTF-8"), "msg-B".getBytes("UTF-8"), 1);
+        producer.send("orders", -1, "user001".getBytes("UTF-8"), "msg-1".getBytes("UTF-8"), 0);
+        producer.send("orders", -1, "user001".getBytes("UTF-8"), "msg-2".getBytes("UTF-8"), 1);
+        producer.send("orders", -1, "user001".getBytes("UTF-8"), "msg-3".getBytes("UTF-8"), -1);
+        producer.send("orders", -1, "user001".getBytes("UTF-8"), "msg-4".getBytes("UTF-8"), 0);
+        producer.send("orders", -1, "user002".getBytes("UTF-8"), "msg-D".getBytes("UTF-8"), 0);
         producer.close();
     }
 }

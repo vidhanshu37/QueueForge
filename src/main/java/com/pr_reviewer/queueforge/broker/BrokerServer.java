@@ -6,9 +6,32 @@ import java.io.*;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.*;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.LinkedBlockingQueue;
 
 public class BrokerServer {
+
+    private static class ReplicationTask {
+        String topic;
+        int partition;
+        long offset;
+        byte[] value;
+
+        ReplicationTask(String topic, int partition, long offset, byte[] value) {
+            this.topic = topic;
+            this.partition = partition;
+            this.offset = offset;
+            this.value = value;
+        }
+    }
+
+    private final Map<String, BlockingQueue<ReplicationTask>> replicationQueues = new ConcurrentHashMap<>();
+
+    private final Map<String, LinkedHashMap<String, Long>> consumerGroups = new ConcurrentHashMap<>();
+
+    private final Map<String, Map<String, Long>> followerOffsets = new ConcurrentHashMap<>();
+    private final int maxLag = 5;
 
     public enum Role { LEADER, FOLLOWER }
 
@@ -38,6 +61,38 @@ public class BrokerServer {
             followerOutputs.put(address, new DataOutputStream(new BufferedOutputStream(socket.getOutputStream())));
             followerInputs.put(address, new DataInputStream(new BufferedInputStream(socket.getInputStream())));
             System.out.println("Connected to follower at " + address);
+
+            BlockingQueue<ReplicationTask> queue = new LinkedBlockingQueue<>();
+            replicationQueues.put(address, queue);
+
+            Thread senderThread = new Thread(() -> runReplicationSender(address, queue));
+            senderThread.setDaemon(true);
+            senderThread.start();
+        }
+    }
+
+    private void runReplicationSender(String address, BlockingQueue<ReplicationTask> queue) {
+        DataOutputStream out = followerOutputs.get(address);
+        DataInputStream in = followerInputs.get(address);
+
+        while (true) {
+            try {
+                ReplicationTask task = queue.take(); // blocks jab tak koi task na aaye, FIFO order mein
+
+                ReplicateRequest repReq = new ReplicateRequest(task.topic, task.partition, task.offset, task.value);
+                Frame repFrame = new Frame(MessageType.REPLICATE, repReq.encode());
+
+                repFrame.writeTo(out);
+                Frame response = Frame.readFrom(in);
+
+                String key = task.topic + "-" + task.partition;
+                followerOffsets.computeIfAbsent(key, k -> new ConcurrentHashMap<>()).put(address, task.offset);
+
+            } catch (InterruptedException e) {
+                break;
+            } catch (IOException e) {
+                System.out.println("Replication sender for " + address + " failed: " + e.getMessage());
+            }
         }
     }
 
@@ -103,7 +158,13 @@ public class BrokerServer {
                     byte[] ackPayload = req.topic.getBytes("UTF-8");
                     Frame response = new Frame(MessageType.PRODUCE_RESPONSE, ackPayload);
                     response.writeTo(out);
-                } else if (frame.type() == MessageType.FETCH) {
+                } else if (frame.type() == MessageType.JOIN_GROUP) {
+                    JoinGroupRequest req = JoinGroupRequest.decode(frame.payload());
+                    JoinGroupResponse resp = handleJoinGroup(req);
+                    Frame response = new Frame(MessageType.JOIN_GROUP_RESPONSE, resp.encode());
+                    response.writeTo(out);
+                }
+                else if (frame.type() == MessageType.FETCH) {
                     FetchRequest req = FetchRequest.decode(frame.payload());
                     FetchResponse resp = handleFetch(req);
                     Frame response = new Frame(MessageType.FETCH_RESPONSE, resp.encode());
@@ -154,22 +215,94 @@ public class BrokerServer {
                 " at offset " + offset + ": " + new String(req.value, java.nio.charset.StandardCharsets.UTF_8));
 
         if (role == Role.LEADER) {
-            replicateToFollowers(req.topic, targetPartition, offset, req.value);
+            if (req.ack == 0 || req.ack == 1) {
+                replicateAsync(req.topic, targetPartition, offset, req.value); // bas queue mein daalo, turant return
+            } else { // ack == -1
+                try {
+                    replicateSync(req.topic, targetPartition, offset, req.value);
+                } catch (InterruptedException e) {
+                    throw new IOException("Replication wait interrupted", e);
+                }
+                List<String> isr = getInSyncReplicas(req.topic, targetPartition, offset);
+                System.out.println("ack=all: confirmed ISR members: " + isr);
+            }
         }
     }
 
-    private void replicateToFollowers(String topic, int partition, long offset, byte[] value) throws IOException {
-        ReplicateRequest repReq = new ReplicateRequest(topic, partition, offset, value);
-        Frame repFrame = new Frame(MessageType.REPLICATE, repReq.encode());
-
+    private void replicateAsync(String topic, int partition, long offset, byte[] value) {
+        ReplicationTask task = new ReplicationTask(topic, partition, offset, value);
         for (String address : followerAddresses) {
-            DataOutputStream out = followerOutputs.get(address);
-            DataInputStream in = followerInputs.get(address);
-
-            repFrame.writeTo(out);
-            Frame response = Frame.readFrom(in); // synchronous wait for now, we will update it later
-            System.out.println("Replicated to " + address + ", ack received");
+            replicationQueues.get(address).offer(task);
         }
+    }
+
+    private void replicateSync(String topic, int partition, long offset, byte[] value) throws IOException, InterruptedException {
+        ReplicationTask task = new ReplicationTask(topic, partition, offset, value);
+        for (String address : followerAddresses) {
+            replicationQueues.get(address).offer(task);
+        }
+        for (String address : followerAddresses) {
+            String key = topic + "-" + partition;
+            while (followerOffsets.getOrDefault(key, Collections.emptyMap()).getOrDefault(address, -1L) < offset) {
+                Thread.sleep(5);
+            }
+        }
+    }
+
+    private final Object replicationLock = new Object();
+    private void replicateToFollowers(String topic, int partition, long offset, byte[] value) throws IOException {
+        synchronized (replicationLock) {
+            ReplicateRequest repReq = new ReplicateRequest(topic, partition, offset, value);
+            Frame repFrame = new Frame(MessageType.REPLICATE, repReq.encode());
+
+            String key = topic + "-" + partition;
+
+            for (String address : followerAddresses) {
+                DataOutputStream out = followerOutputs.get(address);
+                DataInputStream in = followerInputs.get(address);
+
+                repFrame.writeTo(out);
+                Frame response = Frame.readFrom(in);
+
+                followerOffsets.computeIfAbsent(key, k -> new ConcurrentHashMap<>()).put(address, offset);
+            }
+        }
+    }
+
+    private List<String> getInSyncReplicas(String topic, int partition, long leaderOffset) {
+        String key = topic + "-" + partition;
+        Map<String, Long> offsets = followerOffsets.getOrDefault(key, Collections.emptyMap());
+
+        List<String> inSync = new ArrayList<>();
+        for (String address : followerAddresses) {
+            long followerOffset = offsets.getOrDefault(address, -1L);
+            if (leaderOffset - followerOffset <= maxLag) {
+                inSync.add(address);
+            }
+        }
+        return inSync;
+    }
+
+    private synchronized JoinGroupResponse handleJoinGroup(JoinGroupRequest req) {
+        LinkedHashMap<String, Long> members = consumerGroups.computeIfAbsent(req.groupId, g -> new LinkedHashMap<>());
+        members.put(req.consumerId, System.currentTimeMillis());
+
+        List<String> memberList = new ArrayList<>(members.keySet());
+        int myIndex = memberList.indexOf(req.consumerId);
+        int totalMembers = memberList.size();
+
+        List<Partition> partitions = getOrCreatePartitions(req.topic);
+        List<Integer> assigned = new ArrayList<>();
+        for (int p = 0; p < partitions.size(); p++) {
+            if (p % totalMembers == myIndex) {
+                assigned.add(p);
+            }
+        }
+
+        System.out.println("Group '" + req.groupId + "' now has " + totalMembers + " members. " +
+                req.consumerId + " assigned partitions: " + assigned);
+
+        return new JoinGroupResponse(assigned);
     }
 
     public static void main(String[] args) throws IOException {

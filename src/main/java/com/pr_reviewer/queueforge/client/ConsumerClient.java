@@ -1,12 +1,12 @@
 package com.pr_reviewer.queueforge.client;
 
-import com.pr_reviewer.queueforge.protocol.FetchRequest;
-import com.pr_reviewer.queueforge.protocol.FetchResponse;
-import com.pr_reviewer.queueforge.protocol.Frame;
-import com.pr_reviewer.queueforge.protocol.MessageType;
+import com.pr_reviewer.queueforge.protocol.*;
 
 import java.io.*;
 import java.net.Socket;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
 public class ConsumerClient {
     private final String host;
@@ -27,6 +27,15 @@ public class ConsumerClient {
         System.out.println("Consumer connected to broker at " + host + ":" + port);
     }
 
+    public JoinGroupResponse joinGroup(String groupId, String consumerId, String topic) throws IOException {
+        JoinGroupRequest req = new JoinGroupRequest(groupId, consumerId, topic);
+        Frame frame = new Frame(MessageType.JOIN_GROUP, req.encode());
+        frame.writeTo(out);
+
+        Frame response = Frame.readFrom(in);
+        return JoinGroupResponse.decode(response.payload());
+    }
+
     public FetchResponse fetch(String topic, int partition, long offset) throws IOException {
         FetchRequest req = new FetchRequest(topic, partition, offset);
         Frame frame = new Frame(MessageType.FETCH, req.encode());
@@ -36,39 +45,43 @@ public class ConsumerClient {
         return FetchResponse.decode(responseFrame.payload());
     }
 
-    public void pollLoop(String topic, int partition, long startOffset, int maxMessagesToRead) throws IOException, InterruptedException {
-        long currentOffset = startOffset;
-        int messagesRead = 0;
-
-        while (messagesRead < maxMessagesToRead) {
-            FetchResponse resp = fetch(topic, partition, currentOffset);
-
-            if (resp.found) {
-                String value = new String(resp.value, "UTF-8");
-                System.out.println("Consumed from topic '" + topic + "' partition " + partition +
-                        " at offset " + currentOffset + ": " + value);
-                currentOffset = resp.nextOffset;
-                messagesRead++;
-            } else {
-                System.out.println("No message at offset " + currentOffset + ", waiting...");
-                Thread.sleep(1000);
-            }
-        }
-    }
-
     public void close() throws IOException {
         socket.close();
     }
 
     public static void main(String[] args) throws IOException, InterruptedException {
-        ConsumerClient consumer = new ConsumerClient("localhost", 9092);
-        consumer.connect();
+        String leaderHost = args[0];
+        int leaderPort = Integer.parseInt(args[1]);
+        String followerHost = args[2];
+        int followerPort = Integer.parseInt(args[3]);
+        String consumerId = args[4];
+        String groupId = args[5];
+        String topic = args[6];
 
-        consumer.pollLoop("orders", 1, 0, 3);
+        ConsumerClient coordinatorConn = new ConsumerClient(leaderHost, leaderPort);
+        coordinatorConn.connect();
+        JoinGroupResponse joinResp = coordinatorConn.joinGroup(groupId, consumerId, topic);
+        List<Integer> myPartitions = joinResp.assignedPartitions;
+        System.out.println(consumerId + " assigned partitions: " + myPartitions);
+        coordinatorConn.close();
 
-        consumer.close();
+        ConsumerClient dataConn = new ConsumerClient(followerHost, followerPort);
+        dataConn.connect();
+
+        Map<Integer, Long> offsets = new HashMap<>();
+        for (int p : myPartitions) offsets.put(p, 0L);
+
+        while (true) {
+            for (int p : myPartitions) {
+                FetchResponse resp = dataConn.fetch(topic, p, offsets.get(p));
+                if (resp.found) {
+                    System.out.println(consumerId + " read partition " + p + " offset " + offsets.get(p) +
+                            ": " + new String(resp.value, "UTF-8"));
+                    offsets.put(p, resp.nextOffset);
+                }
+            }
+            Thread.sleep(500);
+        }
     }
-
-
 
 }
