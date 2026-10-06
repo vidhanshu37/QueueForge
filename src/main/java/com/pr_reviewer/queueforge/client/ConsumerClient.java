@@ -4,9 +4,7 @@ import com.pr_reviewer.queueforge.protocol.*;
 
 import java.io.*;
 import java.net.Socket;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 public class ConsumerClient {
     private final String host;
@@ -50,38 +48,54 @@ public class ConsumerClient {
     }
 
     public static void main(String[] args) throws IOException, InterruptedException {
-        String leaderHost = args[0];
-        int leaderPort = Integer.parseInt(args[1]);
-        String followerHost = args[2];
-        int followerPort = Integer.parseInt(args[3]);
-        String consumerId = args[4];
-        String groupId = args[5];
-        String topic = args[6];
+        // Usage: java ConsumerClient <bootstrapServers> <consumerId> <groupId> <topic>
+        List<String> bootstrapServers = new ArrayList<>(Arrays.asList(args[0].split(",")));
+        String consumerId = args[1];
+        String groupId = args[2];
+        String topic = args[3];
 
-        ConsumerClient coordinatorConn = new ConsumerClient(leaderHost, leaderPort);
-        coordinatorConn.connect();
+        ConsumerClient coordinatorConn = connectToAny(bootstrapServers);
         JoinGroupResponse joinResp = coordinatorConn.joinGroup(groupId, consumerId, topic);
         List<Integer> myPartitions = joinResp.assignedPartitions;
         System.out.println(consumerId + " assigned partitions: " + myPartitions);
-        coordinatorConn.close();
 
-        ConsumerClient dataConn = new ConsumerClient(followerHost, followerPort);
-        dataConn.connect();
-
+        ConsumerClient dataConn = connectToAny(bootstrapServers);
         Map<Integer, Long> offsets = new HashMap<>();
         for (int p : myPartitions) offsets.put(p, 0L);
 
         while (true) {
             for (int p : myPartitions) {
-                FetchResponse resp = dataConn.fetch(topic, p, offsets.get(p));
-                if (resp.found) {
-                    System.out.println(consumerId + " read partition " + p + " offset " + offsets.get(p) +
-                            ": " + new String(resp.value, "UTF-8"));
-                    offsets.put(p, resp.nextOffset);
+                try {
+                    FetchResponse resp = dataConn.fetch(topic, p, offsets.get(p));
+                    if (resp.found) {
+                        System.out.println(consumerId + " read partition " + p + " offset " + offsets.get(p) +
+                                ": " + new String(resp.value, "UTF-8"));
+                        offsets.put(p, resp.nextOffset);
+                    }
+                } catch (IOException e) {
+                    System.out.println("Connection lost (" + e.getMessage() + "), reconnecting...");
+                    try { dataConn.close(); } catch (IOException ignored) {}
+                    dataConn = connectToAny(bootstrapServers);
                 }
             }
             Thread.sleep(500);
         }
     }
 
+    private static ConsumerClient connectToAny(List<String> bootstrapServers) throws IOException {
+        IOException lastError = null;
+        for (String server : bootstrapServers) {
+            try {
+                String[] parts = server.split(":");
+                ConsumerClient client = new ConsumerClient(parts[0], Integer.parseInt(parts[1]));
+                client.connect();
+                return client;
+            } catch (IOException e) {
+                lastError = e;
+            }
+        }
+        throw new IOException("No brokers reachable", lastError);
+    }
 }
+
+
