@@ -186,6 +186,10 @@ public class Partition {
     }
 
     public synchronized byte[] read(long targetOffset) throws IOException {
+        if (targetOffset < 0 || targetOffset >= nextOffset) {
+            return null;
+        }
+
         Long segStart = segmentMessageCounts.floorKey(targetOffset);
         if (segStart == null) return null;
 
@@ -246,6 +250,42 @@ public class Partition {
 
             System.out.println("Deleted old segment starting at offset " + oldestStart);
         }
+        saveMetadata();
+    }
+
+    public synchronized void appendAt(long offset, byte[] value) throws IOException {
+        if (offset != nextOffset) {
+            throw new IllegalStateException(
+                    "Offset mismatch! Expected " + nextOffset + " but got " + offset +
+                            " - follower aur leader ka state out of sync ho gaya"
+            );
+        }
+
+        if (messagesInActiveSegment >= maxMessagesPerSegment) {
+            startNewSegment(nextOffset);
+            enforceRetention();
+        }
+
+        long position = activeWritePosition;
+
+        ByteBuffer buffer = ByteBuffer.allocate(4 + value.length);
+        buffer.putInt(value.length);
+        buffer.put(value);
+        buffer.flip();
+
+        activeLogChannel.position(position);
+        activeLogChannel.write(buffer);
+
+        long relativeCount = offset - activeSegmentStartOffset;
+        if (relativeCount % indexInterval == 0) {
+            appendIndexEntry(activeIndexChannel, offset, position);
+        }
+
+        activeWritePosition += 4 + value.length;
+        messagesInActiveSegment++;
+        nextOffset++;
+
+        segmentMessageCounts.put(activeSegmentStartOffset, messagesInActiveSegment);
         saveMetadata();
     }
 
