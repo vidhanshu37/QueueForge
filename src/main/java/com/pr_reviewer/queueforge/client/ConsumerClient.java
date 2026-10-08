@@ -48,16 +48,48 @@ public class ConsumerClient {
     }
 
     public static void main(String[] args) throws IOException, InterruptedException {
-        // Usage: java ConsumerClient <bootstrapServers> <consumerId> <groupId> <topic>
+        if (args.length < 4) {
+            System.out.println("Usage: java ConsumerClient <bootstrapServers> <consumerId> <groupId> <topic>");
+            return;
+        }
+
         List<String> bootstrapServers = new ArrayList<>(Arrays.asList(args[0].split(",")));
         String consumerId = args[1];
         String groupId = args[2];
         String topic = args[3];
 
         ConsumerClient coordinatorConn = connectToAny(bootstrapServers);
-        JoinGroupResponse joinResp = coordinatorConn.joinGroup(groupId, consumerId, topic);
+        JoinGroupResponse joinResp = null;
+        int attempts = 0;
+
+        while (joinResp == null || !joinResp.success) {
+            attempts++;
+            if (attempts > 5) {
+                System.out.println("Could not join group after 5 attempts, exiting.");
+                return;
+            }
+
+            joinResp = coordinatorConn.joinGroup(groupId, consumerId, topic);
+
+            if (!joinResp.success) {
+                if (joinResp.leaderHint != null && !joinResp.leaderHint.isEmpty()) {
+                    System.out.println("NOT_LEADER! Redirecting JOIN_GROUP to: " + joinResp.leaderHint);
+                    coordinatorConn.close();
+                    String[] parts = joinResp.leaderHint.split(":");
+                    coordinatorConn = new ConsumerClient(parts[0], Integer.parseInt(parts[1]));
+                    coordinatorConn.connect();
+                } else {
+                    System.out.println("No leader hint (election in progress?), retrying via bootstrap list...");
+                    Thread.sleep(1000);
+                    coordinatorConn.close();
+                    coordinatorConn = connectToAny(bootstrapServers);
+                }
+            }
+        }
+
         List<Integer> myPartitions = joinResp.assignedPartitions;
         System.out.println(consumerId + " assigned partitions: " + myPartitions);
+        coordinatorConn.close();
 
         ConsumerClient dataConn = connectToAny(bootstrapServers);
         Map<Integer, Long> offsets = new HashMap<>();
@@ -92,9 +124,10 @@ public class ConsumerClient {
                 return client;
             } catch (IOException e) {
                 lastError = e;
+                System.out.println("Could not connect to " + server + ", trying next...");
             }
         }
-        throw new IOException("No brokers reachable", lastError);
+        throw new IOException("No brokers reachable from bootstrap list", lastError);
     }
 }
 

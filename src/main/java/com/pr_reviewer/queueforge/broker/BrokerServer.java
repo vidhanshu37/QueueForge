@@ -312,6 +312,12 @@ public class BrokerServer {
     }
 
     private synchronized JoinGroupResponse handleJoinGroup(JoinGroupRequest req) {
+        if (raftState.getRole() != RaftState.NodeRole.LEADER) {
+            String hint = raftState.getCurrentLeaderId();
+            System.out.println("NOT_LEADER (JoinGroup) - redirecting to: " + hint);
+            return new JoinGroupResponse(false, null, hint);
+        }
+
         LinkedHashMap<String, Long> members = consumerGroups.computeIfAbsent(req.groupId, g -> new LinkedHashMap<>());
         members.put(req.consumerId, System.currentTimeMillis());
 
@@ -330,7 +336,7 @@ public class BrokerServer {
         System.out.println("Group '" + req.groupId + "' now has " + totalMembers + " members. " +
                 req.consumerId + " assigned partitions: " + assigned);
 
-        return new JoinGroupResponse(assigned);
+        return new JoinGroupResponse(true, assigned, null);
     }
 
     private void onElectionTimeout() {
