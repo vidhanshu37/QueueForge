@@ -4,9 +4,7 @@ import com.pr_reviewer.queueforge.protocol.*;
 
 import java.io.*;
 import java.net.Socket;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 public class ConsumerClient {
     private final String host;
@@ -50,38 +48,87 @@ public class ConsumerClient {
     }
 
     public static void main(String[] args) throws IOException, InterruptedException {
-        String leaderHost = args[0];
-        int leaderPort = Integer.parseInt(args[1]);
-        String followerHost = args[2];
-        int followerPort = Integer.parseInt(args[3]);
-        String consumerId = args[4];
-        String groupId = args[5];
-        String topic = args[6];
+        if (args.length < 4) {
+            System.out.println("Usage: java ConsumerClient <bootstrapServers> <consumerId> <groupId> <topic>");
+            return;
+        }
 
-        ConsumerClient coordinatorConn = new ConsumerClient(leaderHost, leaderPort);
-        coordinatorConn.connect();
-        JoinGroupResponse joinResp = coordinatorConn.joinGroup(groupId, consumerId, topic);
+        List<String> bootstrapServers = new ArrayList<>(Arrays.asList(args[0].split(",")));
+        String consumerId = args[1];
+        String groupId = args[2];
+        String topic = args[3];
+
+        ConsumerClient coordinatorConn = connectToAny(bootstrapServers);
+        JoinGroupResponse joinResp = null;
+        int attempts = 0;
+
+        while (joinResp == null || !joinResp.success) {
+            attempts++;
+            if (attempts > 5) {
+                System.out.println("Could not join group after 5 attempts, exiting.");
+                return;
+            }
+
+            joinResp = coordinatorConn.joinGroup(groupId, consumerId, topic);
+
+            if (!joinResp.success) {
+                if (joinResp.leaderHint != null && !joinResp.leaderHint.isEmpty()) {
+                    System.out.println("NOT_LEADER! Redirecting JOIN_GROUP to: " + joinResp.leaderHint);
+                    coordinatorConn.close();
+                    String[] parts = joinResp.leaderHint.split(":");
+                    coordinatorConn = new ConsumerClient(parts[0], Integer.parseInt(parts[1]));
+                    coordinatorConn.connect();
+                } else {
+                    System.out.println("No leader hint (election in progress?), retrying via bootstrap list...");
+                    Thread.sleep(1000);
+                    coordinatorConn.close();
+                    coordinatorConn = connectToAny(bootstrapServers);
+                }
+            }
+        }
+
         List<Integer> myPartitions = joinResp.assignedPartitions;
         System.out.println(consumerId + " assigned partitions: " + myPartitions);
         coordinatorConn.close();
 
-        ConsumerClient dataConn = new ConsumerClient(followerHost, followerPort);
-        dataConn.connect();
-
+        ConsumerClient dataConn = connectToAny(bootstrapServers);
         Map<Integer, Long> offsets = new HashMap<>();
         for (int p : myPartitions) offsets.put(p, 0L);
 
         while (true) {
             for (int p : myPartitions) {
-                FetchResponse resp = dataConn.fetch(topic, p, offsets.get(p));
-                if (resp.found) {
-                    System.out.println(consumerId + " read partition " + p + " offset " + offsets.get(p) +
-                            ": " + new String(resp.value, "UTF-8"));
-                    offsets.put(p, resp.nextOffset);
+                try {
+                    FetchResponse resp = dataConn.fetch(topic, p, offsets.get(p));
+                    if (resp.found) {
+                        System.out.println(consumerId + " read partition " + p + " offset " + offsets.get(p) +
+                                ": " + new String(resp.value, "UTF-8"));
+                        offsets.put(p, resp.nextOffset);
+                    }
+                } catch (IOException e) {
+                    System.out.println("Connection lost (" + e.getMessage() + "), reconnecting...");
+                    try { dataConn.close(); } catch (IOException ignored) {}
+                    dataConn = connectToAny(bootstrapServers);
                 }
             }
             Thread.sleep(500);
         }
     }
 
+    private static ConsumerClient connectToAny(List<String> bootstrapServers) throws IOException {
+        IOException lastError = null;
+        for (String server : bootstrapServers) {
+            try {
+                String[] parts = server.split(":");
+                ConsumerClient client = new ConsumerClient(parts[0], Integer.parseInt(parts[1]));
+                client.connect();
+                return client;
+            } catch (IOException e) {
+                lastError = e;
+                System.out.println("Could not connect to " + server + ", trying next...");
+            }
+        }
+        throw new IOException("No brokers reachable from bootstrap list", lastError);
+    }
 }
+
+
