@@ -6,13 +6,20 @@ import com.pr_reviewer.queueforge.protocol.ProduceRequest;
 import com.pr_reviewer.queueforge.protocol.ProduceResponse;
 
 import java.io.*;
+import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.SocketException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Scanner;
 
 public class ProducerClient {
+
+    private static final int CONNECT_TIMEOUT_MS = 2000;
+    private static final int PRODUCE_TIMEOUT_MS = 5000;
+    private static final int ACK_ALL_TIMEOUT_MS = 10000;
+    private int currentTimeoutMs = -1;
 
     private final String host;
     private final int port;
@@ -26,13 +33,15 @@ public class ProducerClient {
     }
 
     public void connect() throws IOException {
-        socket = new Socket(host, port);
+        socket = new Socket();
+        socket.connect(new InetSocketAddress(host, port), CONNECT_TIMEOUT_MS);
         in = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
         out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
         System.out.println("Connected to broker at " + host + ":" + port);
     }
 
     public ProduceResponse send(String topic, int partition, byte[] key, byte[] value, int ack) throws IOException {
+        setReadTimeout(ack == -1 ? ACK_ALL_TIMEOUT_MS : PRODUCE_TIMEOUT_MS);
         ProduceRequest req = new ProduceRequest(topic, partition, key, value, ack);
         Frame frame = new Frame(MessageType.PRODUCE, req.encode());
 
@@ -40,6 +49,13 @@ public class ProducerClient {
 
         Frame responseFrame = Frame.readFrom(in);
         return ProduceResponse.decode(responseFrame.payload());
+    }
+
+    private void setReadTimeout(int ms) throws SocketException {
+        if (ms != currentTimeoutMs) {
+            socket.setSoTimeout(ms);
+            currentTimeoutMs = ms;
+        }
     }
 
     public void close() throws IOException {
@@ -99,6 +115,17 @@ public class ProducerClient {
                     if (resp.success) {
                         System.out.println("Sent: " + value + " (offset=" + resp.offset + ")");
                         sent = true;
+                    } else if (resp.errorCode == ProduceResponse.ERR_NOT_ENOUGH_REPLICAS) {
+                        System.out.println("NOT_ENOUGH_REPLICAS: try later on");
+                        try {
+                            Thread.sleep(500);
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                        }
+                    } else if (resp.errorCode == ProduceResponse.ERR_NOT_ENOUGH_REPLICAS_AFTER_APPEND) {
+                        System.out.println("NOT_ENOUGH_REPLICAS_AFTER_APPEND: message has reached at leader");
+
+                        break;
                     } else {
                         if (resp.leaderHint != null && !resp.leaderHint.isEmpty()) {
                             System.out.println("NOT_LEADER! Redirecting to: " + resp.leaderHint);
@@ -117,7 +144,8 @@ public class ProducerClient {
                     System.out.println("Connection lost (" + e.getMessage() + "), trying another broker...");
                     try {
                         producer.close();
-                    } catch (IOException ignored) {}
+                    } catch (IOException ignored) {
+                    }
                     producer = connectToAny(bootstrapServers);
                 }
             }

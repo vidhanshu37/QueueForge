@@ -5,6 +5,7 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 
 public class Frame {
+    public static final int MAX_FRAME_SIZE = 10 * 1024 * 1024;
     private final MessageType type;
     private final byte[] payload;
 
@@ -31,6 +32,9 @@ public class Frame {
 
     public static Frame readFrom(DataInputStream in) throws IOException {
         int length = in.readInt();
+        if (length < 1 || length > MAX_FRAME_SIZE) {
+            throw new IOException("Invalid frame length: " + length);
+        }
         int typeCode = in.readUnsignedByte(); // 1byte
         int payloadLength = length - 1;
         byte[] payload = new byte[payloadLength];

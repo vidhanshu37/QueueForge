@@ -3,10 +3,17 @@ package com.pr_reviewer.queueforge.client;
 import com.pr_reviewer.queueforge.protocol.*;
 
 import java.io.*;
+import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.SocketException;
 import java.util.*;
 
 public class ConsumerClient {
+    private static final int CONNECT_TIMEOUT_MS = 2000;
+    private static final int FETCH_TIMEOUT_MS = 3000;
+    private static final int JOIN_TIMEOUT_MS = 5000;
+    private int currentTimeoutMs = -1;
+
     private final String host;
     private final int port;
     private Socket socket;
@@ -19,13 +26,15 @@ public class ConsumerClient {
     }
 
     public void connect() throws IOException {
-        socket = new Socket(host, port);
+        socket = new Socket();
+        socket.connect(new InetSocketAddress(host, port), CONNECT_TIMEOUT_MS);
         in = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
         out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
         System.out.println("Consumer connected to broker at " + host + ":" + port);
     }
 
     public JoinGroupResponse joinGroup(String groupId, String consumerId, String topic) throws IOException {
+        setReadTimeout(JOIN_TIMEOUT_MS);
         JoinGroupRequest req = new JoinGroupRequest(groupId, consumerId, topic);
         Frame frame = new Frame(MessageType.JOIN_GROUP, req.encode());
         frame.writeTo(out);
@@ -35,12 +44,20 @@ public class ConsumerClient {
     }
 
     public FetchResponse fetch(String topic, int partition, long offset) throws IOException {
+        setReadTimeout(FETCH_TIMEOUT_MS);
         FetchRequest req = new FetchRequest(topic, partition, offset);
         Frame frame = new Frame(MessageType.FETCH, req.encode());
         frame.writeTo(out);
 
         Frame responseFrame = Frame.readFrom(in);
         return FetchResponse.decode(responseFrame.payload());
+    }
+
+    private void setReadTimeout(int ms) throws SocketException {
+        if (ms != currentTimeoutMs) {
+            socket.setSoTimeout(ms);
+            currentTimeoutMs = ms;
+        }
     }
 
     public void close() throws IOException {

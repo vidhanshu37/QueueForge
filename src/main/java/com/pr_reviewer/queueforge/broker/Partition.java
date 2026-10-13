@@ -32,12 +32,10 @@ public class Partition {
 
         if (loadMetadata()) {
             activeSegmentStartOffset = segmentMessageCounts.lastKey();
-            messagesInActiveSegment = segmentMessageCounts.get(activeSegmentStartOffset);
-            nextOffset = activeSegmentStartOffset + messagesInActiveSegment;
-
             activeLogChannel = openLogChannel(activeSegmentStartOffset);
             activeIndexChannel = openIndexChannel(activeSegmentStartOffset);
-            activeWritePosition = activeLogChannel.size();
+
+            recoverActiveSegment();
 
             System.out.println("Loaded partition from metadata: " + segmentMessageCounts.size() +
                     " segments, nextOffset=" + nextOffset);
@@ -45,6 +43,50 @@ public class Partition {
             startNewSegment(0);
             saveMetadata();
         }
+    }
+
+    private void recoverActiveSegment() throws IOException {
+        long fileSize = activeLogChannel.size();
+        long position = 0;
+        int count = 0;
+        ByteBuffer lenBuf = ByteBuffer.allocate(4);
+
+        while (position + 4 <= fileSize) {
+            lenBuf.clear();
+            activeLogChannel.position(position);
+            activeLogChannel.read(lenBuf);
+            lenBuf.flip();
+            int length = lenBuf.getInt();
+            if (length < 0 || position + 4 + length > fileSize) break;
+            position += 4 + length;
+            count++;
+        }
+
+        if (position < fileSize) {
+            System.out.println("Truncating incomplete tail: " + (fileSize - position) + " bytes");
+            activeLogChannel.truncate(position);
+        }
+
+        activeWritePosition = position;
+        messagesInActiveSegment = count;
+        nextOffset = activeSegmentStartOffset + count;
+        segmentMessageCounts.put(activeSegmentStartOffset, count);
+
+        trimIndex(activeIndexChannel, nextOffset);
+    }
+
+    private void trimIndex(FileChannel indexChannel, long validNextOffset) throws IOException {
+        long entries = indexChannel.size() / INDEX_RECORD_SIZE;
+        ByteBuffer buf = ByteBuffer.allocate(INDEX_RECORD_SIZE);
+        while (entries > 0) {
+            buf.clear();
+            indexChannel.position((entries - 1) * INDEX_RECORD_SIZE);
+            indexChannel.read(buf);
+            buf.flip();
+            if (buf.getLong() < validNextOffset) break;
+            entries--;
+        }
+        indexChannel.truncate(entries * INDEX_RECORD_SIZE);
     }
 
     private Path metadataPath() {
@@ -180,7 +222,7 @@ public class Partition {
         nextOffset++;
 
         segmentMessageCounts.put(activeSegmentStartOffset, messagesInActiveSegment);
-        saveMetadata();
+//        saveMetadata();
 
         return offset;
     }
@@ -286,15 +328,63 @@ public class Partition {
         nextOffset++;
 
         segmentMessageCounts.put(activeSegmentStartOffset, messagesInActiveSegment);
-        saveMetadata();
+//        saveMetadata();
     }
 
-    public long size() {
+    public synchronized long size() {
         return nextOffset;
     }
 
-    public void close() throws IOException {
-        for (FileChannel ch : logChannels.values()) ch.close();
-        for (FileChannel ch : indexChannels.values()) ch.close();
+    public synchronized List<byte[]> readBatch(long fromOffset, int maxMessages) throws IOException {
+        List<byte[]> out = new ArrayList<>();
+        long offset = fromOffset;
+
+        while (out.size() < maxMessages && offset >= 0 && offset < nextOffset) {
+            Long segStart = segmentMessageCounts.floorKey(offset);
+            if (segStart == null) break;
+
+            FileChannel logCh = openLogChannel(segStart);
+            FileChannel idxCh = openIndexChannel(segStart);
+            long[] floor = binarySearchFloor(idxCh, offset);
+            long scanOffset = (floor == null) ? segStart : floor[0];
+            long pos = (floor == null) ? 0 : floor[1];
+            long segEnd = segStart + segmentMessageCounts.get(segStart);
+
+            ByteBuffer lenBuf = ByteBuffer.allocate(4);
+            while (scanOffset < segEnd && out.size() < maxMessages) {
+                lenBuf.clear();
+                logCh.read(lenBuf, pos);
+                lenBuf.flip();
+                int len = lenBuf.getInt();
+
+                if (scanOffset >= offset) {
+                    ByteBuffer valBuf = ByteBuffer.allocate(len);
+                    logCh.read(valBuf, pos + 4);
+                    out.add(valBuf.array());
+                }
+                pos += 4 + len;
+                scanOffset++;
+            }
+
+            if (scanOffset <= offset) break;
+            offset = scanOffset;
+
+        }
+        return out;
+    }
+
+    public synchronized void close() throws IOException {
+        for (FileChannel ch : logChannels.values()) {
+            ch.force(true);
+            ch.close();
+        }
+
+        for (FileChannel ch : indexChannels.values()) {
+            ch.force(true);
+            ch.close();
+        }
+
+        logChannels.clear();
+        indexChannels.clear();
     }
 }
