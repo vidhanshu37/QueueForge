@@ -11,6 +11,15 @@ public class RaftState {
     private final AtomicInteger currentTerm = new AtomicInteger(0);
     private volatile String votedFor = null;
     private final String selfId;
+    private volatile String currentLeaderId = null;
+
+    public synchronized String getCurrentLeaderId() {
+        return currentLeaderId;
+    }
+
+    public synchronized void setCurrentLeaderId(String leaderId) {
+        this.currentLeaderId = leaderId;
+    }
 
     public RaftState(String selfId) {
         this.selfId = selfId;
@@ -39,6 +48,7 @@ public class RaftState {
     public synchronized void becomeLeader() {
         if (role == NodeRole.CANDIDATE) {
             role = NodeRole.LEADER;
+            currentLeaderId = selfId;
             System.out.println("[" + selfId + "] Became LEADER for term " + currentTerm.get());
         }
     }

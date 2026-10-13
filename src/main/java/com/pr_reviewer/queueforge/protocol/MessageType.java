@@ -8,7 +8,12 @@ public enum MessageType {
     REPLICATE(5),
     REPLICATE_RESPONSE(6),
     JOIN_GROUP(7),
-    JOIN_GROUP_RESPONSE(8);
+    JOIN_GROUP_RESPONSE(8),
+    REQUEST_VOTE(9),
+    REQUEST_VOTE_RESPONSE(10),
+    HEARTBEAT(11),
+    HEARTBEAT_RESPONSE(12);
+
 
     private final int code;
 
