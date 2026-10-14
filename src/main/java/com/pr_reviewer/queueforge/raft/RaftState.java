@@ -38,6 +38,7 @@ public class RaftState {
     }
 
     public synchronized int startElection() {
+        currentLeaderId = null;
         role = NodeRole.CANDIDATE;
         int newTerm = currentTerm.incrementAndGet();
         votedFor = selfId;
@@ -46,6 +47,7 @@ public class RaftState {
     }
 
     public synchronized void becomeLeader() {
+
         if (role == NodeRole.CANDIDATE) {
             role = NodeRole.LEADER;
             currentLeaderId = selfId;
@@ -57,19 +59,26 @@ public class RaftState {
         if (term > currentTerm.get()) {
             currentTerm.set(term);
             votedFor = null;
+            currentLeaderId = null;
         }
         role = NodeRole.FOLLOWER;
     }
 
-    public synchronized boolean handleVoteRequest(int candidateTerm, String candidateId) {
+    public synchronized boolean handleVoteRequest(int candidateTerm, String candidateId, boolean candidateUpToDate) {
         if (candidateTerm < currentTerm.get()) {
             return false;
         }
         if (candidateTerm > currentTerm.get()) {
             currentTerm.set(candidateTerm);
             votedFor = null;
+            currentLeaderId = null;
             role = NodeRole.FOLLOWER;
         }
+
+        if (!candidateUpToDate) {
+            return false;
+        }
+
         if (votedFor == null || votedFor.equals(candidateId)) {
             votedFor = candidateId;
             System.out.println("[" + selfId + "] Voted for " + candidateId + " in term " + candidateTerm);

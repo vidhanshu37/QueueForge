@@ -5,13 +5,68 @@ import com.pr_reviewer.queueforge.raft.ElectionTimer;
 import com.pr_reviewer.queueforge.raft.RaftState;
 
 import java.io.*;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class BrokerServer {
+
+    private final Map<String, PeerConn> controlConns = new ConcurrentHashMap<>();
+    private final Map<String, PeerConn> dataConns = new ConcurrentHashMap<>();
+
+    private static class PeerConn {
+        final Socket socket;
+        final DataInputStream in;
+        final DataOutputStream out;
+
+        PeerConn(Socket socket) throws IOException {
+            this.socket = socket;
+            socket.setSoTimeout(2000);
+            socket.setTcpNoDelay(true);
+            this.in = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
+            this.out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
+        }
+
+        void close() {
+            try { socket.close(); } catch (IOException ignored) {}
+        }
+    }
+
+    private PeerConn getConn(Map<String, PeerConn> pool, String peer) throws IOException {
+        PeerConn conn = pool.get(peer);
+        if (conn != null) return conn;
+
+        String[] parts = peer.split(":");
+        Socket socket = new Socket();
+        socket.connect(new InetSocketAddress(parts[0], Integer.parseInt(parts[1])), 1000);
+        conn = new PeerConn(socket);
+
+        PeerConn existing = pool.putIfAbsent(peer, conn);
+        if (existing != null) {
+            conn.close();
+            return existing;
+        }
+        return conn;
+    }
+
+    private Frame roundTrip(Map<String, PeerConn> pool, String peer, Frame request) throws IOException {
+        PeerConn conn = getConn(pool, peer);
+        synchronized (conn) {
+            try {
+                request.writeTo(conn.out);
+                return Frame.readFrom(conn.in);
+            } catch (IOException e) {
+                pool.remove(peer, conn);
+                conn.close();
+                throw e;
+            }
+        }
+    }
 
     private static class ReplicationTask {
         String topic;
@@ -30,9 +85,18 @@ public class BrokerServer {
     private ScheduledExecutorService heartbeatScheduler;
 
     private final List<String> allPeers; // all nodes(peer) address expect current
-    private final Map<String, Socket> peerSockets = new ConcurrentHashMap<>();
-    private final Map<String, DataOutputStream> peerOutputs = new ConcurrentHashMap<>();
-    private final Map<String, DataInputStream> peerInputs = new ConcurrentHashMap<>();
+//    private final Map<String, Socket> peerSockets = new ConcurrentHashMap<>();
+//    private final Map<String, DataOutputStream> peerOutputs = new ConcurrentHashMap<>();
+//    private final Map<String, DataInputStream> peerInputs = new ConcurrentHashMap<>();
+
+    private static final int MIN_INSYNC_REPLICAS = 2;
+    private static final long ACK_ALL_TIMEOUT_MS = 5000;
+    private static final int MAX_ISR_LAG = 5;
+    private final Map<String, Set<String>> isr = new ConcurrentHashMap<>();
+    private final Set<String> downPeers = ConcurrentHashMap.newKeySet();
+    private final Map<String, Object> ackMonitors = new ConcurrentHashMap<>();
+    private final AtomicInteger ackWaiters = new AtomicInteger();
+    private final Set<String> probesQueued = ConcurrentHashMap.newKeySet();
 
     private RaftState raftState;
     private ElectionTimer electionTimer;
@@ -42,7 +106,6 @@ public class BrokerServer {
     private final Map<String, LinkedHashMap<String, Long>> consumerGroups = new ConcurrentHashMap<>();
 
     private final Map<String, Map<String, Long>> followerOffsets = new ConcurrentHashMap<>();
-    private final int maxLag = 5;
 
 //    public enum Role { LEADER, FOLLOWER }
 
@@ -63,23 +126,23 @@ public class BrokerServer {
         this.allPeers = allPeers;
     }
 
-    private List<String> getCurrentFollowers() {
-        return allPeers;
-    }
+//    private List<String> getCurrentFollowers() {
+//        return allPeers;
+//    }
 
-    private DataOutputStream getOrConnectPeer(String peerAddress) throws IOException {
-        if (peerOutputs.containsKey(peerAddress)) {
-            return peerOutputs.get(peerAddress);
-        }
-        String[] parts = peerAddress.split(":");
-        Socket socket = new Socket(parts[0], Integer.parseInt(parts[1]));
-        peerSockets.put(peerAddress, socket);
-        DataOutputStream out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
-        DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
-        peerOutputs.put(peerAddress, out);
-        peerInputs.put(peerAddress, in);
-        return out;
-    }
+//    private DataOutputStream getOrConnectPeer(String peerAddress) throws IOException {
+//        if (peerOutputs.containsKey(peerAddress)) {
+//            return peerOutputs.get(peerAddress);
+//        }
+//        String[] parts = peerAddress.split(":");
+//        Socket socket = new Socket(parts[0], Integer.parseInt(parts[1]));
+//        peerSockets.put(peerAddress, socket);
+//        DataOutputStream out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
+//        DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
+//        peerOutputs.put(peerAddress, out);
+//        peerInputs.put(peerAddress, in);
+//        return out;
+//    }
 
 //    private void connectToFollowers() throws IOException {
 //        for (String address : followerAddresses) {
@@ -98,28 +161,6 @@ public class BrokerServer {
 //            senderThread.start();
 //        }
 //    }
-
-    private void runReplicationSender(String address, BlockingQueue<ReplicationTask> queue) {
-        while (true) {
-            try {
-                ReplicationTask task = queue.take();
-                DataOutputStream out = getOrConnectPeer(address);
-                DataInputStream in = peerInputs.get(address);
-
-                ReplicateRequest repReq = new ReplicateRequest(task.topic, task.partition, task.offset, task.value);
-                Frame repFrame = new Frame(MessageType.REPLICATE, repReq.encode());
-                repFrame.writeTo(out);
-                Frame.readFrom(in);
-
-                String key = task.topic + "-" + task.partition;
-                followerOffsets.computeIfAbsent(key, k -> new ConcurrentHashMap<>()).put(address, task.offset);
-            } catch (InterruptedException e) {
-                break;
-            } catch (IOException e) {
-                System.out.println("Replication sender for " + address + " failed: " + e.getMessage());
-            }
-        }
-    }
 
     private List<Partition> getOrCreatePartitions(String topic) {
         return topicPartitions.computeIfAbsent(topic, t -> {
@@ -152,12 +193,25 @@ public class BrokerServer {
         return new Random().nextInt(partitions.size());
     }
 
+    private void loadExistingTopics() {
+        File[] dirs = new File("data/data-" + port).listFiles(File::isDirectory);
+        if (dirs == null) return;
+        for (File d : dirs) {
+            String name = d.getName();
+            int dash = name.lastIndexOf('-');
+            if (dash <= 0) continue;
+            getOrCreatePartitions(name.substring(0, dash));
+        }
+    }
+
     public void start() throws IOException {
+        loadExistingTopics();
         raftState = new RaftState("localhost:" + port);
         electionTimer = new ElectionTimer(3000, 5000, this::onElectionTimeout);
         electionTimer.reset();
 
         ServerSocket serverSocket = new ServerSocket(port);
+        Runtime.getRuntime().addShutdownHook(new Thread(this::shutdown, "shutdown-hook"));
         System.out.println("Broker server started on port " + port);
 
         while (true) {
@@ -168,7 +222,33 @@ public class BrokerServer {
         }
     }
 
+    private void shutdown() {
+        System.out.println("Shutting down broker " + port + "...");
+        if (electionTimer != null)
+            electionTimer.stop();
+
+        if (heartbeatScheduler != null) heartbeatScheduler.shutdownNow();
+
+        for (PeerConn c : controlConns.values())
+            c.close();
+
+        for (PeerConn c : dataConns.values())
+            c.close();
+
+        for (List<Partition> partitions : topicPartitions.values()) {
+            for (Partition p : partitions) {
+                try {
+                    p.close();
+                } catch (IOException e) {
+                    System.out.println("Error closing partition: " + e.getMessage());
+                }
+            }
+        }
+        System.out.println("Shutdown complete.");
+    }
+
     private void handleClient(Socket socket) {
+
         try {
             DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
             DataOutputStream out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
@@ -193,6 +273,7 @@ public class BrokerServer {
                     response.writeTo(out);
                 } else if (frame.type() == MessageType.HEARTBEAT) {
                     HeartbeatRequest req = HeartbeatRequest.decode(frame.payload());
+
                     if (req.term >= raftState.getCurrentTerm()) {
                         raftState.becomeFollower(req.term);
                         raftState.setCurrentLeaderId(req.leaderId);
@@ -202,18 +283,25 @@ public class BrokerServer {
                     response.writeTo(out);
                 } else if (frame.type() == MessageType.REPLICATE) {
                     ReplicateRequest repReq = ReplicateRequest.decode(frame.payload());
-                    List<Partition> partitions = getOrCreatePartitions(repReq.topic);
+                    Partition p = getOrCreatePartitions(repReq.topic).get(repReq.partition);
 
-                    try {
-                        partitions.get(repReq.partition).appendAt(repReq.offset, repReq.value);
-                        System.out.println("[FOLLOWER] Replicated message at partition " + repReq.partition +
-                                " offset " + repReq.offset);
-                    } catch (IllegalStateException ex) {
-                        System.out.println("[FOLLOWER] Offset miss-match detected (expected sync issue after leader change): " + ex.getMessage());
+                    boolean ok;
+                    if (repReq.offset < p.size()) {
+                        ok = true;
+                    } else {
+                        try {
+                            p.appendAt(repReq.offset, repReq.value);
+                            ok = true;
+                        } catch (IllegalStateException ex) {
+                            ok = false;
+                            System.out.println("[FOLLOWER] gap on " + repReq.topic + "-" + repReq.partition
+                                    + ": have " + p.size() + ", got " + repReq.offset);
+                        }
                     }
 
-                    Frame response = new Frame(MessageType.REPLICATE_RESPONSE, new byte[]{1});
-                    response.writeTo(out);
+                    byte[] ackPayload = ByteBuffer.allocate(9)
+                            .put((byte) (ok ? 1 : 0)).putLong(p.size()).array();
+                    new Frame(MessageType.REPLICATE_RESPONSE, ackPayload).writeTo(out);
                 } else if (frame.type() == MessageType.REQUEST_VOTE) {
                     RequestVoteRequest req = RequestVoteRequest.decode(frame.payload());
                     boolean granted = raftState.handleVoteRequest(req.term, req.candidateId);
@@ -247,68 +335,136 @@ public class BrokerServer {
     }
 
     private ProduceResponse handleProduce(ProduceRequest req) throws IOException {
-        if(raftState.getRole() != RaftState.NodeRole.LEADER) {
+        if (raftState.getRole() != RaftState.NodeRole.LEADER) {
             String hint = raftState.getCurrentLeaderId();
             System.out.println("NOT_LEADER - redirecting producer to: " + hint);
-            return new ProduceResponse(false, -1, hint);
+            return new ProduceResponse(false, -1, ProduceResponse.ERR_NOT_LEADER, hint);
         }
 
         List<Partition> partitions = getOrCreatePartitions(req.topic);
         int targetPartition = selectPartition(req.topic, req.partition, req.key);
+        String key = req.topic + "-" + targetPartition;
+        boolean ackAll = req.ack != 0 && req.ack != 1;
+
+        if (ackAll && 1 + isrFor(key).size() < MIN_INSYNC_REPLICAS) {
+            return new ProduceResponse(false, -1, ProduceResponse.ERR_NOT_ENOUGH_REPLICAS, null);
+        }
+
         long offset = partitions.get(targetPartition).append(req.value);
+        replicateAsync(req.topic, targetPartition, offset, req.value);
 
-        System.out.println("Stored message in topic '" + req.topic + "' partition " + targetPartition + " at offset " + offset + ": " + new String(req.value, StandardCharsets.UTF_8));
-
-        if (req.ack == 0 || req.ack == 1) {
-            replicateAsync(req.topic, targetPartition, offset, req.value);
-        } else {
+        if (ackAll) {
             try {
-                replicateSync(req.topic, targetPartition, offset, req.value);
-                List<String> isr = getInSyncReplicas(req.topic, targetPartition, offset);
-                System.out.println("ack=all: confirmed ISR members: " + isr);
+                awaitIsrAcks(key, offset);
             } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
                 throw new IOException("Replication wait interrupted", e);
+            }
+            if (1 + isrFor(key).size() < MIN_INSYNC_REPLICAS) {
+                return new ProduceResponse(false, -1, ProduceResponse.ERR_NOT_ENOUGH_REPLICAS_AFTER_APPEND, null);
             }
         }
         return new ProduceResponse(true, offset, null);
     }
 
     private void replicateAsync(String topic, int partition, long offset, byte[] value) {
-       for(String peer : allPeers) {
-           replicationQueues.computeIfAbsent(peer, p -> {
-               BlockingQueue<ReplicationTask> queue = new LinkedBlockingQueue<>();
-               Thread senderThread = new Thread(() -> runReplicationSender(p, queue));
-               senderThread.setDaemon(true);
-               senderThread.start();
-               return queue;
-           }).offer(new ReplicationTask(topic, partition, offset, value));
-       }
-    }
-
-    private void replicateSync(String topic, int partition, long offset, byte[] value) throws IOException, InterruptedException {
-        replicateAsync(topic, partition, offset, value);
         for (String peer : allPeers) {
-            String key = topic + "-" + partition;
-            while (followerOffsets.getOrDefault(key, Collections.emptyMap()).getOrDefault(peer, -1L) < offset) {
-                Thread.sleep(5);
+            queueFor(peer).offer(new ReplicationTask(topic, partition, offset, value));
+        }
+    }
+
+    private Object monitorFor(String key) {
+        return ackMonitors.computeIfAbsent(key, k -> new Object());
+    }
+
+    private void notifyAcks(String key) {
+        Object m = monitorFor(key);
+        synchronized (m) {
+            m.notifyAll();
+        }
+    }
+
+    private boolean shrink(String key, String peer) {
+        boolean removed = isrFor(key).remove(peer);
+        if (removed) {
+            System.out.println("[ISR] " + key + " - " + peer);
+            notifyAcks(key);
+        }
+        return removed;
+    }
+    private void shrinkPeerEverywhere(String peer) {
+        for (String key : isr.keySet()) {
+            shrink(key, peer);
+        }
+    }
+
+    private List<String> pendingIsr(String key, long offset) {
+        Map<String, Long> acked = followerOffsets.getOrDefault(key, Collections.emptyMap());
+        List<String> pending = new ArrayList<>();
+        for (String peer : isrFor(key)) {
+            if (acked.getOrDefault(peer, -1L) < offset) pending.add(peer);
+        }
+        return pending;
+    }
+
+    private void awaitIsrAcks(String key, long offset) throws InterruptedException {
+        Object m = monitorFor(key);
+        long deadline = System.currentTimeMillis() + ACK_ALL_TIMEOUT_MS;
+        ackWaiters.incrementAndGet();
+        try {
+            synchronized (m) {
+                while (true) {
+                    List<String> pending = pendingIsr(key, offset);
+                    if (pending.isEmpty()) return;
+                    long remaining = deadline - System.currentTimeMillis();
+                    if (remaining <= 0) {
+                        for (String peer : pending) shrink(key, peer);
+                        return;
+                    }
+                    m.wait(remaining);
+                }
+            }
+        } finally {
+            ackWaiters.decrementAndGet();
+        }
+    }
+
+    private void probeLaggingPeer(String peer) {
+        for (Map.Entry<String, List<Partition>> e : topicPartitions.entrySet()) {
+            for (int p = 0; p < e.getValue().size(); p++) {
+                String key = e.getKey() + "-" + p;
+                if (isrFor(key).contains(peer)) continue;
+                if (!probesQueued.add(peer + "|" + key)) continue;
+                queueFor(peer).offer(new ReplicationTask(e.getKey(), p, -1, null));
             }
         }
     }
 
+    private void resetLeaderState() {
+        isr.clear();
+        followerOffsets.clear();
+        downPeers.clear();
+        probesQueued.clear();
+    }
 
-
-    private List<String> getInSyncReplicas(String topic, int partition, long leaderOffset) {
-        String key = topic + "-" + partition;
-        Map<String, Long> offsets = followerOffsets.getOrDefault(key, Collections.emptyMap());
-
-        List<String> inSync = new ArrayList<>();
-        for (String address : allPeers) {
-            long followerOffset = offsets.getOrDefault(address, -1L);
-            if (leaderOffset - followerOffset <= maxLag) {
-                inSync.add(address);
+    private Set<String> isrFor(String key) {
+        return isr.computeIfAbsent(key, k -> {
+            Set<String> members = ConcurrentHashMap.newKeySet();
+            for (String peer : allPeers) {
+                if (!downPeers.contains(peer)) members.add(peer);
             }
-        }
-        return inSync;
+            return members;
+        });
+    }
+
+    private BlockingQueue<ReplicationTask> queueFor(String peer) {
+        return replicationQueues.computeIfAbsent(peer, p -> {
+            BlockingQueue<ReplicationTask> queue = new LinkedBlockingQueue<>();
+            Thread senderThread = new Thread(() -> runReplicationSender(p, queue));
+            senderThread.setDaemon(true);
+            senderThread.start();
+            return queue;
+        });
     }
 
     private synchronized JoinGroupResponse handleJoinGroup(JoinGroupRequest req) {
@@ -340,7 +496,8 @@ public class BrokerServer {
     }
 
     private void onElectionTimeout() {
-        if(raftState.getRole() == RaftState.NodeRole.LEADER) {
+
+        if (raftState.getRole() == RaftState.NodeRole.LEADER) {
             return;
         }
 
@@ -350,16 +507,11 @@ public class BrokerServer {
         int votesReceived = 1; // already voted for self
         int majorityNeeded = (allPeers.size() + 1) / 2 + 1;
 
-        for(String peer : allPeers) {
+        for (String peer : allPeers) {
             try {
                 RequestVoteRequest req = new RequestVoteRequest(newTerm, raftState.getSelfId());
-                Frame frame = new Frame(MessageType.REQUEST_VOTE, req.encode());
-
-                DataOutputStream out = getOrConnectPeer(peer);
-                DataInputStream in = peerInputs.get(peer);
-
-                frame.writeTo(out);
-                Frame responseFrame = Frame.readFrom(in);
+                Frame responseFrame = roundTrip(controlConns, peer,
+                        new Frame(MessageType.REQUEST_VOTE, req.encode()));
                 RequestVoteResponse resp = RequestVoteResponse.decode(responseFrame.payload());
 
                 if (resp.term > raftState.getCurrentTerm()) {
@@ -379,25 +531,122 @@ public class BrokerServer {
 
         if (votesReceived >= majorityNeeded && raftState.getRole() == RaftState.NodeRole.CANDIDATE) {
             raftState.becomeLeader();
+            resetLeaderState();
             startHeartbeats();
         } else {
             electionTimer.reset();
         }
     }
 
+    private static class ReplicateAck {
+        final boolean ok;
+        final long nextOffset;
+        ReplicateAck(boolean ok, long nextOffset) { this.ok = ok; this.nextOffset = nextOffset; }
+    }
+
+    private ReplicateAck sendReplicate(String address, String topic, int partition, long offset, byte[] value) throws IOException {
+        ReplicateRequest req = new ReplicateRequest(topic, partition, offset, value);
+        Frame resp = roundTrip(dataConns, address, new Frame(MessageType.REPLICATE, req.encode()));
+        ByteBuffer buf = ByteBuffer.wrap(resp.payload());
+        boolean ok = buf.get() == 1;
+        return new ReplicateAck(ok, buf.getLong());
+    }
+
+    private void markAcked(String topic, int partition, String address, long offset) {
+        String key = topic + "-" + partition;
+        followerOffsets.computeIfAbsent(key, k -> new ConcurrentHashMap<>())
+                .merge(address, offset, Math::max);
+        downPeers.remove(address);
+
+        Set<String> members = isrFor(key);
+        if (!members.contains(address)) {
+            long leaderLast = getOrCreatePartitions(topic).get(partition).size() - 1;
+            if (leaderLast - offset <= MAX_ISR_LAG && members.add(address)) {
+                System.out.println("[ISR] " + key + " + " + address + " (caught up at " + offset + ")");
+            }
+        }
+        if (ackWaiters.get() > 0) notifyAcks(key);
+    }
+
+    private void runReplicationSender(String address, BlockingQueue<ReplicationTask> queue) {
+        while (true) {
+            try {
+                ReplicationTask task = queue.take();
+                if (task.offset < 0) {
+                    // probe: peer ko leader ka aakhri record bhejo. In-sync ho to duplicate-ok, peeche ho to gap -> catch-up
+                    probesQueued.remove(address + "|" + task.topic + "-" + task.partition);
+                    Partition leaderLog = getOrCreatePartitions(task.topic).get(task.partition);
+                    long last = leaderLog.size() - 1;
+                    if (last < 0) continue;
+                    List<byte[]> rec = leaderLog.readBatch(last, 1);
+                    if (rec.isEmpty()) continue;
+                    replicateOne(address, task.topic, task.partition, last, rec.get(0));
+                } else {
+                    replicateOne(address, task.topic, task.partition, task.offset, task.value);
+                }
+            } catch (InterruptedException e) {
+                break;
+            } catch (IOException e) {
+                if (downPeers.add(address)) {
+                    System.out.println("[ISR] replication to " + address + " failed (" + e.getMessage() + ") -> removing from ISR");
+                }
+                shrinkPeerEverywhere(address);
+            }
+        }
+    }
+
+    private void replicateOne(String address, String topic, int partition, long offset, byte[] value) throws IOException {
+        ReplicateAck ack = sendReplicate(address, topic, partition, offset, value);
+        if (ack.ok) {
+            markAcked(topic, partition, address, offset);
+        } else {
+            catchUp(address, topic, partition, ack.nextOffset);
+        }
+    }
+
+    private void catchUp(String address, String topic, int partition, long from) throws IOException {
+        Partition leaderLog = getOrCreatePartitions(topic).get(partition);
+        String key = topic + "-" + partition;
+        long cursor = from;
+        System.out.println("[LEADER] catch-up " + address + " " + key + " from " + cursor + " to " + leaderLog.size());
+
+        while (cursor < leaderLog.size()) {
+            List<byte[]> batch = leaderLog.readBatch(cursor, 500);
+            if (batch.isEmpty()) {
+                System.out.println("[LEADER] catch-up aborted for " + address + " " + key+ ": offset " + cursor + " leader log mein nahi hai (retention)");
+                return;
+            }
+            for (byte[] value : batch) {
+                ReplicateAck ack = sendReplicate(address, topic, partition, cursor, value);
+                if (!ack.ok) {
+                    if (ack.nextOffset == cursor) return;
+                    cursor = ack.nextOffset;
+                    break;
+                }
+                markAcked(topic, partition, address, cursor);
+                cursor++;
+            }
+        }
+        System.out.println("[LEADER] catch-up done for " + address + " " + key + " at " + cursor);
+    }
+
+
+
     private void startHeartbeats() {
+        if (heartbeatScheduler != null) heartbeatScheduler.shutdownNow();
         heartbeatScheduler = Executors.newSingleThreadScheduledExecutor();
         heartbeatScheduler.scheduleAtFixedRate(() -> {
-            for(String peer : allPeers) {
+            if (raftState.getRole() != RaftState.NodeRole.LEADER) {
+                heartbeatScheduler.shutdown();
+                return;
+            }
+            for (String peer : allPeers) {
                 try {
                     HeartbeatRequest req = new HeartbeatRequest(raftState.getCurrentTerm(), raftState.getSelfId());
-                    Frame frame = new Frame(MessageType.HEARTBEAT, req.encode());
-                    DataOutputStream out = getOrConnectPeer(peer);
-                    DataInputStream in = peerInputs.get(peer);
-                    frame.writeTo(out);
-                    Frame.readFrom(in);
+                    roundTrip(controlConns, peer, new Frame(MessageType.HEARTBEAT, req.encode()));
+                    probeLaggingPeer(peer);
                 } catch (IOException e) {
-//                    System.out.println("Heartbeat to " + peer + " failed: " + e.getMessage());
+                    System.out.println("Could not send heartbeat to " + peer + ": " + e.getMessage());
                 }
             }
         }, 0, 1000, TimeUnit.MILLISECONDS);
