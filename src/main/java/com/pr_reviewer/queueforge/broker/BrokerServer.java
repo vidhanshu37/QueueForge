@@ -107,6 +107,8 @@ public class BrokerServer {
 
     private final Map<String, Map<String, Long>> followerOffsets = new ConcurrentHashMap<>();
 
+
+
 //    public enum Role { LEADER, FOLLOWER }
 
 //    private final Role role;
@@ -204,9 +206,33 @@ public class BrokerServer {
         }
     }
 
+    private boolean isCandidateUpToDate(String candidateId, Map<String, Long> candidateEnds) {
+        for (Map.Entry<String, Long> mine : localLogEnds().entrySet()) {
+            long theirs = candidateEnds.getOrDefault(mine.getKey(), 0L);
+            if (theirs < mine.getValue()) {
+                System.out.println("[VOTE] rejecting " + candidateId + ": behind on " + mine.getKey()
+                        + " (candidate " + theirs + " < mine " + mine.getValue() + ")");
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private Map<String, Long> localLogEnds() {
+        Map<String, Long> ends = new HashMap<>();
+        for (Map.Entry<String, List<Partition>> e : topicPartitions.entrySet()) {
+            List<Partition> ps = e.getValue();
+            for (int i = 0; i < ps.size(); i++) {
+                ends.put(e.getKey() + "-" + i, ps.get(i).size());
+            }
+        }
+        return ends;
+    }
+
     public void start() throws IOException {
+
         loadExistingTopics();
-        raftState = new RaftState("localhost:" + port);
+        raftState = new RaftState("localhost:" + port, new File("data/data-" + port + "/raft-state"));
         electionTimer = new ElectionTimer(3000, 5000, this::onElectionTimeout);
         electionTimer.reset();
 
@@ -304,7 +330,8 @@ public class BrokerServer {
                     new Frame(MessageType.REPLICATE_RESPONSE, ackPayload).writeTo(out);
                 } else if (frame.type() == MessageType.REQUEST_VOTE) {
                     RequestVoteRequest req = RequestVoteRequest.decode(frame.payload());
-                    boolean granted = raftState.handleVoteRequest(req.term, req.candidateId);
+                    boolean upToDate = isCandidateUpToDate(req.candidateId, req.logEnds);
+                    boolean granted = raftState.handleVoteRequest(req.term, req.candidateId, upToDate);
                     RequestVoteResponse resp = new RequestVoteResponse(granted, raftState.getCurrentTerm());
                     Frame response = new Frame(MessageType.REQUEST_VOTE_RESPONSE, resp.encode());
                     response.writeTo(out);
@@ -499,6 +526,7 @@ public class BrokerServer {
 
         if (raftState.getRole() == RaftState.NodeRole.LEADER) {
             return;
+
         }
 
         int newTerm = raftState.startElection();
@@ -507,9 +535,11 @@ public class BrokerServer {
         int votesReceived = 1; // already voted for self
         int majorityNeeded = (allPeers.size() + 1) / 2 + 1;
 
+        Map<String, Long> myLogEnds = localLogEnds();
+
         for (String peer : allPeers) {
             try {
-                RequestVoteRequest req = new RequestVoteRequest(newTerm, raftState.getSelfId());
+                RequestVoteRequest req = new RequestVoteRequest(newTerm, raftState.getSelfId(), myLogEnds);
                 Frame responseFrame = roundTrip(controlConns, peer,
                         new Frame(MessageType.REQUEST_VOTE, req.encode()));
                 RequestVoteResponse resp = RequestVoteResponse.decode(responseFrame.payload());
