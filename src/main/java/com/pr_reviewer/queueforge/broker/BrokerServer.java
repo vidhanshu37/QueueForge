@@ -107,6 +107,8 @@ public class BrokerServer {
 
     private final Map<String, Map<String, Long>> followerOffsets = new ConcurrentHashMap<>();
 
+
+
 //    public enum Role { LEADER, FOLLOWER }
 
 //    private final Role role;
@@ -187,8 +189,9 @@ public class BrokerServer {
             return requestedPartition;
         }
         if (key != null) {
-            int hash = java.util.Arrays.hashCode(key);
-            return Math.floorMod(hash, partitions.size());
+//            int hash = java.util.Arrays.hashCode(key);
+//            return Math.floorMod(hash, partitions.size());
+            return Partitioner.partitionFor(key, partitions.size());
         }
         return new Random().nextInt(partitions.size());
     }
@@ -204,9 +207,33 @@ public class BrokerServer {
         }
     }
 
+    private boolean isCandidateUpToDate(String candidateId, Map<String, Long> candidateEnds) {
+        for (Map.Entry<String, Long> mine : localLogEnds().entrySet()) {
+            long theirs = candidateEnds.getOrDefault(mine.getKey(), 0L);
+            if (theirs < mine.getValue()) {
+                System.out.println("[VOTE] rejecting " + candidateId + ": behind on " + mine.getKey()
+                        + " (candidate " + theirs + " < mine " + mine.getValue() + ")");
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private Map<String, Long> localLogEnds() {
+        Map<String, Long> ends = new HashMap<>();
+        for (Map.Entry<String, List<Partition>> e : topicPartitions.entrySet()) {
+            List<Partition> ps = e.getValue();
+            for (int i = 0; i < ps.size(); i++) {
+                ends.put(e.getKey() + "-" + i, ps.get(i).size());
+            }
+        }
+        return ends;
+    }
+
     public void start() throws IOException {
+
         loadExistingTopics();
-        raftState = new RaftState("localhost:" + port);
+        raftState = new RaftState("localhost:" + port, new File("data/data-" + port + "/raft-state"));
         electionTimer = new ElectionTimer(3000, 5000, this::onElectionTimeout);
         electionTimer.reset();
 
@@ -268,6 +295,7 @@ public class BrokerServer {
                     response.writeTo(out);
                 } else if (frame.type() == MessageType.FETCH) {
                     FetchRequest req = FetchRequest.decode(frame.payload());
+
                     FetchResponse resp = handleFetch(req);
                     Frame response = new Frame(MessageType.FETCH_RESPONSE, resp.encode());
                     response.writeTo(out);
@@ -304,10 +332,16 @@ public class BrokerServer {
                     new Frame(MessageType.REPLICATE_RESPONSE, ackPayload).writeTo(out);
                 } else if (frame.type() == MessageType.REQUEST_VOTE) {
                     RequestVoteRequest req = RequestVoteRequest.decode(frame.payload());
-                    boolean granted = raftState.handleVoteRequest(req.term, req.candidateId);
+                    boolean upToDate = isCandidateUpToDate(req.candidateId, req.logEnds);
+                    boolean granted = raftState.handleVoteRequest(req.term, req.candidateId, upToDate);
                     RequestVoteResponse resp = new RequestVoteResponse(granted, raftState.getCurrentTerm());
                     Frame response = new Frame(MessageType.REQUEST_VOTE_RESPONSE, resp.encode());
                     response.writeTo(out);
+
+                } else if (frame.type() == MessageType.LIST_OFFSETS) {
+                    ListOffsetsRequest req = ListOffsetsRequest.decode(frame.payload());
+                    ListOffsetsResponse resp = handleListOffsets(req);
+                    new Frame(MessageType.LIST_OFFSETS_RESPONSE, resp.encode()).writeTo(out);
                 } else {
                     System.out.println("Received unknown message type: " + frame.type());
                 }
@@ -321,17 +355,42 @@ public class BrokerServer {
         }
     }
 
+    private ListOffsetsResponse handleListOffsets(ListOffsetsRequest req) {
+        List<Partition> partitions = getOrCreatePartitions(req.topic);
+        if (req.partition < 0 || req.partition >= partitions.size()) {
+            return new ListOffsetsResponse(ListOffsetsResponse.ERR_UNKNOWN_PARTITION, partitions.size(), -1, -1);
+        }
+        Partition p = partitions.get(req.partition);
+        return new ListOffsetsResponse(ListOffsetsResponse.ERR_NONE, partitions.size(),
+                p.earliestOffset(), p.size());
+    }
+
     private FetchResponse handleFetch(FetchRequest req) throws IOException {
         List<Partition> partitions = getOrCreatePartitions(req.topic);
         if (req.partition < 0 || req.partition >= partitions.size()) {
-            return new FetchResponse(false, null, -1);
+            return FetchResponse.error(FetchResponse.ERR_UNKNOWN_PARTITION, -1, -1);
         }
         Partition partition = partitions.get(req.partition);
+        long earliest = partition.earliestOffset();
+        long latest = partition.size();
+
+        if (req.offset < earliest || req.offset > latest) {
+            System.out.println("[FETCH] OUT_OF_RANGE " + req.topic + "-" + req.partition
+                    + " requested=" + req.offset + " earliest=" + earliest + " latest=" + latest);
+            return FetchResponse.error(FetchResponse.ERR_OFFSET_OUT_OF_RANGE, earliest, latest);
+        }
+        if (req.offset == latest) {
+            return FetchResponse.caughtUp(earliest, latest);
+        }
+
         byte[] value = partition.read(req.offset);
         if (value == null) {
-            return new FetchResponse(false, null, -1);
+            long newEarliest = partition.earliestOffset();
+            System.out.println("[FETCH] OUT_OF_RANGE (raced with retention) " + req.topic + "-" + req.partition
+                    + " requested=" + req.offset + " earliest=" + newEarliest);
+            return FetchResponse.error(FetchResponse.ERR_OFFSET_OUT_OF_RANGE, newEarliest, partition.size());
         }
-        return new FetchResponse(true, value, req.offset + 1);
+        return FetchResponse.record(value, req.offset + 1, earliest, latest);
     }
 
     private ProduceResponse handleProduce(ProduceRequest req) throws IOException {
@@ -499,6 +558,7 @@ public class BrokerServer {
 
         if (raftState.getRole() == RaftState.NodeRole.LEADER) {
             return;
+
         }
 
         int newTerm = raftState.startElection();
@@ -507,9 +567,11 @@ public class BrokerServer {
         int votesReceived = 1; // already voted for self
         int majorityNeeded = (allPeers.size() + 1) / 2 + 1;
 
+        Map<String, Long> myLogEnds = localLogEnds();
+
         for (String peer : allPeers) {
             try {
-                RequestVoteRequest req = new RequestVoteRequest(newTerm, raftState.getSelfId());
+                RequestVoteRequest req = new RequestVoteRequest(newTerm, raftState.getSelfId(), myLogEnds);
                 Frame responseFrame = roundTrip(controlConns, peer,
                         new Frame(MessageType.REQUEST_VOTE, req.encode()));
                 RequestVoteResponse resp = RequestVoteResponse.decode(responseFrame.payload());

@@ -335,6 +335,10 @@ public class Partition {
         return nextOffset;
     }
 
+    public synchronized long earliestOffset() {
+        return segmentMessageCounts.firstKey();
+    }
+
     public synchronized List<byte[]> readBatch(long fromOffset, int maxMessages) throws IOException {
         List<byte[]> out = new ArrayList<>();
         long offset = fromOffset;

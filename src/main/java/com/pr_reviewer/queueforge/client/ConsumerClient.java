@@ -9,16 +9,16 @@ import java.net.SocketException;
 import java.util.*;
 
 public class ConsumerClient {
-    private static final int CONNECT_TIMEOUT_MS = 2000;
-    private static final int FETCH_TIMEOUT_MS = 3000;
-    private static final int JOIN_TIMEOUT_MS = 5000;
-    private int currentTimeoutMs = -1;
-
     private final String host;
     private final int port;
     private Socket socket;
     private DataInputStream in;
     private DataOutputStream out;
+
+    private static final int CONNECT_TIMEOUT_MS = 2000;
+    private static final int FETCH_TIMEOUT_MS = 3000;
+    private static final int JOIN_TIMEOUT_MS = 5000;
+    private int currentTimeoutMs = -1;
 
     public ConsumerClient(String host, int port) {
         this.host = host;
@@ -53,6 +53,15 @@ public class ConsumerClient {
         return FetchResponse.decode(responseFrame.payload());
     }
 
+    public ListOffsetsResponse listOffsets(String topic, int partition) throws IOException {
+        setReadTimeout(FETCH_TIMEOUT_MS);
+        ListOffsetsRequest req = new ListOffsetsRequest(topic, partition);
+        new Frame(MessageType.LIST_OFFSETS, req.encode()).writeTo(out);
+
+        Frame responseFrame = Frame.readFrom(in);
+        return ListOffsetsResponse.decode(responseFrame.payload());
+    }
+
     private void setReadTimeout(int ms) throws SocketException {
         if (ms != currentTimeoutMs) {
             socket.setSoTimeout(ms);
@@ -66,7 +75,7 @@ public class ConsumerClient {
 
     public static void main(String[] args) throws IOException, InterruptedException {
         if (args.length < 4) {
-            System.out.println("Usage: java ConsumerClient <bootstrapServers> <consumerId> <groupId> <topic>");
+            System.out.println("Usage: java ConsumerClient <bootstrapServers> <consumerId> <groupId> <topic> [--from earliest|latest|<offset>]");
             return;
         }
 
@@ -74,6 +83,16 @@ public class ConsumerClient {
         String consumerId = args[1];
         String groupId = args[2];
         String topic = args[3];
+
+        String startPolicy = "earliest";
+        for (int i = 4; i < args.length - 1; i++) {
+            if (args[i].equals("--from")) startPolicy = args[i + 1];
+        }
+        boolean fromLatest = startPolicy.equals("latest");
+        Long fromExact = null;
+        if (!startPolicy.equals("earliest") && !fromLatest) {
+            fromExact = Long.parseLong(startPolicy);
+        }
 
         ConsumerClient coordinatorConn = connectToAny(bootstrapServers);
         JoinGroupResponse joinResp = null;
@@ -110,7 +129,16 @@ public class ConsumerClient {
 
         ConsumerClient dataConn = connectToAny(bootstrapServers);
         Map<Integer, Long> offsets = new HashMap<>();
-        for (int p : myPartitions) offsets.put(p, 0L);
+        for (int p : myPartitions) {
+            ListOffsetsResponse lo = dataConn.listOffsets(topic, p);
+            long start;
+            if (fromExact != null) start = fromExact;
+            else if (fromLatest) start = lo.latestOffset;
+            else start = lo.earliestOffset;
+            offsets.put(p, start);
+            System.out.println(consumerId + " partition " + p + " start=" + start
+                    + " (policy=" + startPolicy + ", earliest=" + lo.earliestOffset + ", latest=" + lo.latestOffset + ")");
+        }
 
         while (true) {
             for (int p : myPartitions) {
@@ -120,6 +148,12 @@ public class ConsumerClient {
                         System.out.println(consumerId + " read partition " + p + " offset " + offsets.get(p) +
                                 ": " + new String(resp.value, "UTF-8"));
                         offsets.put(p, resp.nextOffset);
+                    } else if (resp.errorCode == FetchResponse.ERR_OFFSET_OUT_OF_RANGE) {
+                        long resetTo = fromLatest ? resp.latestOffset : resp.earliestOffset;
+                        System.out.println("[WARN] " + consumerId + " partition " + p + " offset " + offsets.get(p)
+                                + " out of range (earliest=" + resp.earliestOffset + ", latest=" + resp.latestOffset
+                                + "). Resetting to " + resetTo + " (policy=" + (fromLatest ? "latest" : "earliest") + ")");
+                        offsets.put(p, resetTo);
                     }
                 } catch (IOException e) {
                     System.out.println("Connection lost (" + e.getMessage() + "), reconnecting...");
@@ -147,5 +181,3 @@ public class ConsumerClient {
         throw new IOException("No brokers reachable from bootstrap list", lastError);
     }
 }
-
-
