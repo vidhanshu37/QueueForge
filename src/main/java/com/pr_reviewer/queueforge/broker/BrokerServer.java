@@ -189,8 +189,9 @@ public class BrokerServer {
             return requestedPartition;
         }
         if (key != null) {
-            int hash = java.util.Arrays.hashCode(key);
-            return Math.floorMod(hash, partitions.size());
+//            int hash = java.util.Arrays.hashCode(key);
+//            return Math.floorMod(hash, partitions.size());
+            return Partitioner.partitionFor(key, partitions.size());
         }
         return new Random().nextInt(partitions.size());
     }
@@ -294,6 +295,7 @@ public class BrokerServer {
                     response.writeTo(out);
                 } else if (frame.type() == MessageType.FETCH) {
                     FetchRequest req = FetchRequest.decode(frame.payload());
+
                     FetchResponse resp = handleFetch(req);
                     Frame response = new Frame(MessageType.FETCH_RESPONSE, resp.encode());
                     response.writeTo(out);
@@ -335,6 +337,11 @@ public class BrokerServer {
                     RequestVoteResponse resp = new RequestVoteResponse(granted, raftState.getCurrentTerm());
                     Frame response = new Frame(MessageType.REQUEST_VOTE_RESPONSE, resp.encode());
                     response.writeTo(out);
+
+                } else if (frame.type() == MessageType.LIST_OFFSETS) {
+                    ListOffsetsRequest req = ListOffsetsRequest.decode(frame.payload());
+                    ListOffsetsResponse resp = handleListOffsets(req);
+                    new Frame(MessageType.LIST_OFFSETS_RESPONSE, resp.encode()).writeTo(out);
                 } else {
                     System.out.println("Received unknown message type: " + frame.type());
                 }
@@ -348,17 +355,42 @@ public class BrokerServer {
         }
     }
 
+    private ListOffsetsResponse handleListOffsets(ListOffsetsRequest req) {
+        List<Partition> partitions = getOrCreatePartitions(req.topic);
+        if (req.partition < 0 || req.partition >= partitions.size()) {
+            return new ListOffsetsResponse(ListOffsetsResponse.ERR_UNKNOWN_PARTITION, partitions.size(), -1, -1);
+        }
+        Partition p = partitions.get(req.partition);
+        return new ListOffsetsResponse(ListOffsetsResponse.ERR_NONE, partitions.size(),
+                p.earliestOffset(), p.size());
+    }
+
     private FetchResponse handleFetch(FetchRequest req) throws IOException {
         List<Partition> partitions = getOrCreatePartitions(req.topic);
         if (req.partition < 0 || req.partition >= partitions.size()) {
-            return new FetchResponse(false, null, -1);
+            return FetchResponse.error(FetchResponse.ERR_UNKNOWN_PARTITION, -1, -1);
         }
         Partition partition = partitions.get(req.partition);
+        long earliest = partition.earliestOffset();
+        long latest = partition.size();
+
+        if (req.offset < earliest || req.offset > latest) {
+            System.out.println("[FETCH] OUT_OF_RANGE " + req.topic + "-" + req.partition
+                    + " requested=" + req.offset + " earliest=" + earliest + " latest=" + latest);
+            return FetchResponse.error(FetchResponse.ERR_OFFSET_OUT_OF_RANGE, earliest, latest);
+        }
+        if (req.offset == latest) {
+            return FetchResponse.caughtUp(earliest, latest);
+        }
+
         byte[] value = partition.read(req.offset);
         if (value == null) {
-            return new FetchResponse(false, null, -1);
+            long newEarliest = partition.earliestOffset();
+            System.out.println("[FETCH] OUT_OF_RANGE (raced with retention) " + req.topic + "-" + req.partition
+                    + " requested=" + req.offset + " earliest=" + newEarliest);
+            return FetchResponse.error(FetchResponse.ERR_OFFSET_OUT_OF_RANGE, newEarliest, partition.size());
         }
-        return new FetchResponse(true, value, req.offset + 1);
+        return FetchResponse.record(value, req.offset + 1, earliest, latest);
     }
 
     private ProduceResponse handleProduce(ProduceRequest req) throws IOException {
