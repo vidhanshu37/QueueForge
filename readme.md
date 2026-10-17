@@ -118,9 +118,9 @@ java -cp target/classes com.pr_reviewer.queueforge.test.FetchProbe localhost:909
 Measured with `LoadTestProducer` (a single-threaded, synchronous producer: one request in flight at a time) against 3 brokers running on one laptop, so network cost is close to zero and results reflect this implementation, not a real cluster. Each figure is from 100,000 messages, 5 consecutive runs on a warm cluster.
 
 | Ack level | Throughput (median) | p50 latency | p99 latency |
-|---|---|---|---|
+|---|---------------------|---|---|
 | `ack=0` | about 14,000 msgs/s | 0.06 ms | 0.19 ms |
-| `ack=-1` (all in-sync replicas) | about 1,900 msgs/s | 0.47 ms | about 1 ms |
+| `ack=-1` (all in-sync replicas) | about 4,900 msgs/s  | 0.47 ms | about 1 ms |
 
 With two producers in parallel, `ack=-1` throughput rose to about 4,250 msgs/s in total (roughly 2.2x), which shows the single producer is latency-bound rather than the broker being saturated.
 
