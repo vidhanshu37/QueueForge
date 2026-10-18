@@ -33,7 +33,10 @@ public class BrokerServer {
         }
 
         void close() {
-            try { socket.close(); } catch (IOException ignored) {}
+            try {
+                socket.close();
+            } catch (IOException ignored) {
+            }
         }
     }
 
@@ -103,10 +106,12 @@ public class BrokerServer {
 
     private final Map<String, BlockingQueue<ReplicationTask>> replicationQueues = new ConcurrentHashMap<>();
 
+    private static final String OFFSETS_TOPIC = "__consumer_offsets";
+    private final Map<String, Long> committedOffsets = new ConcurrentHashMap<>();
+    private volatile boolean offsetsReady = false;
     private final Map<String, LinkedHashMap<String, Long>> consumerGroups = new ConcurrentHashMap<>();
 
     private final Map<String, Map<String, Long>> followerOffsets = new ConcurrentHashMap<>();
-
 
 
 //    public enum Role { LEADER, FOLLOWER }
@@ -327,9 +332,10 @@ public class BrokerServer {
                         }
                     }
 
-                    byte[] ackPayload = ByteBuffer.allocate(9)
-                            .put((byte) (ok ? 1 : 0)).putLong(p.size()).array();
+                    byte[] ackPayload = ByteBuffer.allocate(9).put((byte) (ok ? 1 : 0)).putLong(p.size()).array();
+
                     new Frame(MessageType.REPLICATE_RESPONSE, ackPayload).writeTo(out);
+
                 } else if (frame.type() == MessageType.REQUEST_VOTE) {
                     RequestVoteRequest req = RequestVoteRequest.decode(frame.payload());
                     boolean upToDate = isCandidateUpToDate(req.candidateId, req.logEnds);
@@ -342,6 +348,14 @@ public class BrokerServer {
                     ListOffsetsRequest req = ListOffsetsRequest.decode(frame.payload());
                     ListOffsetsResponse resp = handleListOffsets(req);
                     new Frame(MessageType.LIST_OFFSETS_RESPONSE, resp.encode()).writeTo(out);
+                } else if (frame.type() == MessageType.OFFSET_COMMIT) {
+                    OffsetCommitRequest req = OffsetCommitRequest.decode(frame.payload());
+                    OffsetCommitResponse resp = handleOffsetCommit(req);
+                    new Frame(MessageType.OFFSET_COMMIT_RESPONSE, resp.encode()).writeTo(out);
+                } else if (frame.type() == MessageType.OFFSET_FETCH) {
+                    OffsetFetchRequest req = OffsetFetchRequest.decode(frame.payload());
+                    OffsetFetchResponse resp = handleOffsetFetch(req);
+                    new Frame(MessageType.OFFSET_FETCH_RESPONSE, resp.encode()).writeTo(out);
                 } else {
                     System.out.println("Received unknown message type: " + frame.type());
                 }
@@ -351,9 +365,14 @@ public class BrokerServer {
         } catch (IOException e) {
             System.out.println("Connection error: " + e.getMessage());
         } finally {
-            try { socket.close(); } catch (IOException ignored) {}
+            try {
+                socket.close();
+            } catch (IOException ignored) {
+            }
         }
     }
+
+
 
     private ListOffsetsResponse handleListOffsets(ListOffsetsRequest req) {
         List<Partition> partitions = getOrCreatePartitions(req.topic);
@@ -400,17 +419,21 @@ public class BrokerServer {
             return new ProduceResponse(false, -1, ProduceResponse.ERR_NOT_LEADER, hint);
         }
 
-        List<Partition> partitions = getOrCreatePartitions(req.topic);
         int targetPartition = selectPartition(req.topic, req.partition, req.key);
-        String key = req.topic + "-" + targetPartition;
         boolean ackAll = req.ack != 0 && req.ack != 1;
+        return appendReplicated(req.topic, targetPartition, req.value, ackAll);
+    }
+
+    private ProduceResponse appendReplicated(String topic, int targetPartition, byte[] value, boolean ackAll) throws IOException {
+        List<Partition> partitions = getOrCreatePartitions(topic);
+        String key = topic + "-" + targetPartition;
 
         if (ackAll && 1 + isrFor(key).size() < MIN_INSYNC_REPLICAS) {
             return new ProduceResponse(false, -1, ProduceResponse.ERR_NOT_ENOUGH_REPLICAS, null);
         }
 
-        long offset = partitions.get(targetPartition).append(req.value);
-        replicateAsync(req.topic, targetPartition, offset, req.value);
+        long offset = partitions.get(targetPartition).append(value);
+        replicateAsync(topic, targetPartition, offset, value);
 
         if (ackAll) {
             try {
@@ -424,6 +447,65 @@ public class BrokerServer {
             }
         }
         return new ProduceResponse(true, offset, null);
+    }
+
+    private OffsetCommitResponse handleOffsetCommit(OffsetCommitRequest req) throws IOException {
+        if (raftState.getRole() != RaftState.NodeRole.LEADER) {
+            return new OffsetCommitResponse(OffsetCommitResponse.ERR_NOT_LEADER, raftState.getCurrentLeaderId());
+        }
+
+        if (!offsetsReady) {
+            return new OffsetCommitResponse(OffsetCommitResponse.ERR_NOT_READY, null);
+        }
+
+        int target = Partitioner.partitionFor(req.groupId.getBytes("UTF-8"), numPartitionPerTopic);
+
+        ProduceResponse r = appendReplicated(OFFSETS_TOPIC, target, req.encode(), true);
+        if (!r.success) {
+            System.out.println("[OFFSETS] commit failed for " + req.mapKey() + " (errorCode=" + r.errorCode + ")");
+            return new OffsetCommitResponse(OffsetCommitResponse.ERR_NOT_ENOUGH_REPLICAS, null);
+        }
+
+        committedOffsets.put(req.mapKey(), req.offset);
+        System.out.println("[OFFSETS] committed " + req.mapKey() + " = " + req.offset);
+        return new OffsetCommitResponse(OffsetCommitResponse.ERR_NONE, null);
+    }
+
+    private OffsetFetchResponse handleOffsetFetch(OffsetFetchRequest req) {
+        if (raftState.getRole() != RaftState.NodeRole.LEADER) {
+            return new OffsetFetchResponse(OffsetCommitResponse.ERR_NOT_LEADER, OffsetFetchResponse.NO_COMMIT,
+                    raftState.getCurrentLeaderId());
+        }
+        if (!offsetsReady) {
+            return new OffsetFetchResponse(OffsetCommitResponse.ERR_NOT_READY, OffsetFetchResponse.NO_COMMIT, null);
+        }
+        Long committed = committedOffsets.get(req.groupId + "|" + req.topic + "|" + req.partition);
+        return new OffsetFetchResponse(OffsetCommitResponse.ERR_NONE,
+                committed == null ? OffsetFetchResponse.NO_COMMIT : committed, null);
+    }
+
+    private void rebuildCommittedOffsets() {
+        committedOffsets.clear();
+        int records = 0;
+        try {
+            for (Partition p : getOrCreatePartitions(OFFSETS_TOPIC)) {
+                long next = p.earliestOffset();
+                while (next < p.size()) {
+                    List<byte[]> batch = p.readBatch(next, 500);
+                    if (batch.isEmpty()) break;
+                    for (byte[] rec : batch) {
+                        OffsetCommitRequest c = OffsetCommitRequest.decode(rec);
+                        committedOffsets.put(c.mapKey(), c.offset);
+                        records++;
+                    }
+                    next += batch.size();
+                }
+            }
+        } catch (IOException e) {
+            throw new RuntimeException("Could not rebuild committed offsets", e);
+        }
+        System.out.println("[OFFSETS] rebuilt " + committedOffsets.size()
+                + " committed offsets from " + records + " log records");
     }
 
     private void replicateAsync(String topic, int partition, long offset, byte[] value) {
@@ -451,6 +533,7 @@ public class BrokerServer {
         }
         return removed;
     }
+
     private void shrinkPeerEverywhere(String peer) {
         for (String key : isr.keySet()) {
             shrink(key, peer);
@@ -592,9 +675,12 @@ public class BrokerServer {
         }
 
         if (votesReceived >= majorityNeeded && raftState.getRole() == RaftState.NodeRole.CANDIDATE) {
+            offsetsReady = false;
             raftState.becomeLeader();
             resetLeaderState();
             startHeartbeats();
+            rebuildCommittedOffsets();
+            offsetsReady = true;
         } else {
             electionTimer.reset();
         }
@@ -603,7 +689,11 @@ public class BrokerServer {
     private static class ReplicateAck {
         final boolean ok;
         final long nextOffset;
-        ReplicateAck(boolean ok, long nextOffset) { this.ok = ok; this.nextOffset = nextOffset; }
+
+        ReplicateAck(boolean ok, long nextOffset) {
+            this.ok = ok;
+            this.nextOffset = nextOffset;
+        }
     }
 
     private ReplicateAck sendReplicate(String address, String topic, int partition, long offset, byte[] value) throws IOException {
@@ -675,7 +765,7 @@ public class BrokerServer {
         while (cursor < leaderLog.size()) {
             List<byte[]> batch = leaderLog.readBatch(cursor, 500);
             if (batch.isEmpty()) {
-                System.out.println("[LEADER] catch-up aborted for " + address + " " + key+ ": offset " + cursor + " leader log mein nahi hai (retention)");
+                System.out.println("[LEADER] catch-up aborted for " + address + " " + key + ": offset " + cursor + " leader log mein nahi hai (retention)");
                 return;
             }
             for (byte[] value : batch) {
@@ -691,7 +781,6 @@ public class BrokerServer {
         }
         System.out.println("[LEADER] catch-up done for " + address + " " + key + " at " + cursor);
     }
-
 
 
     private void startHeartbeats() {
