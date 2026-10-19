@@ -8,6 +8,8 @@ import java.net.Socket;
 import java.net.SocketException;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class ConsumerClient {
     private final String host;
@@ -20,6 +22,8 @@ public class ConsumerClient {
     private static final int FETCH_TIMEOUT_MS = 3000;
     private static final int JOIN_TIMEOUT_MS = 5000;
     private static final long COMMIT_INTERVAL_MS = 1000;
+    private static final long HEARTBEAT_INTERVAL_MS = 3000;
+    private static final long GROUP_SESSION_TIMEOUT_MS = 10_000;
     private int currentTimeoutMs = -1;
 
     public ConsumerClient(String host, int port) {
@@ -47,6 +51,15 @@ public class ConsumerClient {
 
         Frame response = Frame.readFrom(in);
         return JoinGroupResponse.decode(response.payload());
+    }
+
+    public GroupHeartbeatResponse groupHeartbeat(String groupId, String consumerId, int generation) throws IOException {
+        setReadTimeout(FETCH_TIMEOUT_MS);
+        GroupHeartbeatRequest req = new GroupHeartbeatRequest(groupId, consumerId, generation);
+        new Frame(MessageType.GROUP_HEARTBEAT, req.encode()).writeTo(out);
+
+        Frame responseFrame = Frame.readFrom(in);
+        return GroupHeartbeatResponse.decode(responseFrame.payload());
     }
 
     public FetchResponse fetch(String topic, int partition, long offset) throws IOException {
@@ -104,6 +117,7 @@ public class ConsumerClient {
         String groupId = args[2];
         String topic = args[3];
 
+
         String startPolicy = null;
         for (int i = 4; i < args.length - 1; i++) {
             if (args[i].equals("--from")) startPolicy = args[i + 1];
@@ -146,7 +160,10 @@ public class ConsumerClient {
 
         List<Integer> myPartitions = joinResp.assignedPartitions;
         System.out.println(consumerId + " assigned partitions: " + myPartitions);
+
         LeaderLink leader = new LeaderLink(bootstrapServers, coordinatorConn);
+        AtomicInteger generation = new AtomicInteger(joinResp.generation);
+        AtomicBoolean rebalanceNeeded = new AtomicBoolean(false);
 
         ConsumerClient dataConn = connectToAny(bootstrapServers);
         Map<Integer, Long> offsets = new ConcurrentHashMap<>();
@@ -161,6 +178,7 @@ public class ConsumerClient {
             } else {
                 OffsetFetchResponse c = leader.fetchCommitted(groupId, topic, p, 6);
                 if (c == null) {
+
                     System.out.println("[ERROR] could not read committed offset for partition " + p
                             + " (leader unreachable?). Not guessing a start position, exiting.");
                     return;
@@ -179,8 +197,9 @@ public class ConsumerClient {
                     + ", earliest=" + lo.earliestOffset + ", latest=" + lo.latestOffset + ")");
         }
 
+
         Runnable commitDirty = () -> {
-            for (int p : myPartitions) {
+            for (int p : new TreeSet<>(offsets.keySet())) {
                 Long cur = offsets.get(p);
                 if (cur != null && !cur.equals(committed.get(p))) {
                     if (leader.commit(groupId, topic, p, cur, 2)) {
@@ -192,24 +211,105 @@ public class ConsumerClient {
                 }
             }
         };
+
         Runtime.getRuntime().addShutdownHook(new Thread(commitDirty, "commit-on-exit"));
         long lastCommitMs = System.currentTimeMillis();
 
+
+        LeaderLink heartbeatLink = new LeaderLink(bootstrapServers, null);
+        Thread heartbeatThread = new Thread(() -> {
+            long lastOk = System.currentTimeMillis();
+            while (true) {
+                try {
+                    Thread.sleep(HEARTBEAT_INTERVAL_MS);
+                } catch (InterruptedException e) {
+                    return;
+                }
+                GroupHeartbeatResponse r = heartbeatLink.heartbeat(groupId, consumerId, generation.get(), 2);
+                long now = System.currentTimeMillis();
+                if (r == null) {
+
+                    if (now - lastOk > GROUP_SESSION_TIMEOUT_MS) {
+                        System.out.println("[WARN] " + consumerId + " no heartbeat reply for " + (now - lastOk) + " ms, will rejoin");
+                        rebalanceNeeded.set(true);
+                        lastOk = now;
+                    }
+                    continue;
+                }
+                lastOk = now;
+                if (r.errorCode == GroupHeartbeatResponse.ERR_UNKNOWN_MEMBER) {
+                    System.out.println("[GROUP] " + consumerId + " unknown to group (expired / new leader), will rejoin");
+                    rebalanceNeeded.set(true);
+                } else if (r.errorCode == GroupHeartbeatResponse.ERR_REBALANCE && r.generation != generation.get()) {
+                    System.out.println("[GROUP] " + consumerId + " group generation " + generation.get() + " -> " + r.generation + ", will rejoin");
+                    rebalanceNeeded.set(true);
+                }
+            }
+        }, "group-heartbeat");
+        heartbeatThread.setDaemon(true);
+        heartbeatThread.start();
+
         while (true) {
+
+            if (rebalanceNeeded.getAndSet(false)) {
+                System.out.println("[GROUP] " + consumerId + " rebalancing: committing, then rejoining group");
+                commitDirty.run();
+                JoinGroupResponse jr = leader.join(groupId, consumerId, topic, 5);
+                if (jr == null) {
+                    System.out.println("[WARN] " + consumerId + " could not rejoin yet, will retry");
+                    rebalanceNeeded.set(true);
+                    Thread.sleep(1000);
+                    continue;
+                }
+                generation.set(jr.generation);
+                Set<Integer> newSet = new HashSet<>(jr.assignedPartitions);
+                for (int p : new TreeSet<>(offsets.keySet())) {
+                    if (!newSet.contains(p)) {
+                        offsets.remove(p);
+                        committed.remove(p);
+                        System.out.println("[GROUP] " + consumerId + " released partition " + p);
+                    }
+                }
+                try {
+                    for (int p : jr.assignedPartitions) {
+                        if (offsets.containsKey(p)) continue;
+                        OffsetFetchResponse c = leader.fetchCommitted(groupId, topic, p, 6);
+                        if (c == null) {
+                            System.out.println("[WARN] " + consumerId + " could not read bookmark for partition " + p + ", will retry");
+                            rebalanceNeeded.set(true);
+                            continue;
+                        }
+                        long start = c.offset != OffsetFetchResponse.NO_COMMIT
+                                ? c.offset : dataConn.listOffsets(topic, p).earliestOffset;
+                        offsets.put(p, start);
+                        if (c.offset != OffsetFetchResponse.NO_COMMIT) committed.put(p, c.offset);
+                        System.out.println("[GROUP] " + consumerId + " got partition " + p + ", start=" + start
+                                + (c.offset != OffsetFetchResponse.NO_COMMIT ? " (committed)" : " (no commit yet, earliest)"));
+                    }
+                } catch (IOException e) {
+                    System.out.println("Connection lost during rebalance (" + e.getMessage() + "), reconnecting...");
+                    try { dataConn.close(); } catch (IOException ignored) {}
+                    dataConn = connectToAny(bootstrapServers);
+                    rebalanceNeeded.set(true);
+                }
+                System.out.println("[GROUP] " + consumerId + " generation=" + jr.generation + " partitions=" + new TreeSet<>(offsets.keySet()));
+            }
+
             boolean gotAny = false;
-            for (int p : myPartitions) {
+            for (int p : new TreeSet<>(offsets.keySet())) {
                 try {
                     FetchResponse resp = dataConn.fetch(topic, p, offsets.get(p));
                     if (resp.found) {
-                        gotAny = true;
                         System.out.println(consumerId + " read partition " + p + " offset " + offsets.get(p) +
                                 ": " + new String(resp.value, "UTF-8"));
                         offsets.put(p, resp.nextOffset);
+                        gotAny = true;
                     } else if (resp.errorCode == FetchResponse.ERR_OFFSET_OUT_OF_RANGE) {
                         long cur = offsets.get(p);
                         long earliest = resp.earliestOffset;
                         long latest = resp.latestOffset;
                         if (cur > resp.latestOffset) {
+
                             ListOffsetsResponse lo = leader.listOffsets(groupId, topic, p);
                             if (lo == null) {
                                 System.out.println("[WARN] " + consumerId + " partition " + p + ": offset " + cur
@@ -233,12 +333,14 @@ public class ConsumerClient {
                             earliest = lo.earliestOffset;
                             latest = lo.latestOffset;
                         }
+
                         long resetTo = fromLatest ? latest : earliest;
                         System.out.println("[WARN] " + consumerId + " partition " + p + " offset " + cur
                                 + " out of range (earliest=" + earliest + ", latest=" + latest
                                 + "). Resetting to " + resetTo + " (policy=" + (fromLatest ? "latest" : "earliest") + ")");
                         offsets.put(p, resetTo);
                     }
+
                 } catch (IOException e) {
                     System.out.println("Connection lost (" + e.getMessage() + "), reconnecting...");
                     try { dataConn.close(); } catch (IOException ignored) {}
@@ -255,6 +357,12 @@ public class ConsumerClient {
         }
     }
 
+
+    /**
+     * Leader se baat karne ka wrapper: commit, bookmark-fetch aur authoritative ListOffsets sirf leader par.
+     * Connection toot jaye, leader badal jaye (NOT_LEADER) ya naya leader load kar raha ho (NOT_READY) to khud retry karta hai.
+     * Sab methods synchronized: main loop aur shutdown hook ek hi connection ek saath use kar sakte hain.
+     */
     private static class LeaderLink {
         private final List<String> bootstrap;
         private ConsumerClient conn;
@@ -263,11 +371,55 @@ public class ConsumerClient {
         LeaderLink(List<String> bootstrap, ConsumerClient leaderConn) {
             this.bootstrap = bootstrap;
             this.conn = leaderConn;
-            this.confirmedLeader = leaderConn.address();
+            this.confirmedLeader = leaderConn == null ? null : leaderConn.address();
         }
 
         synchronized String address() {
             return confirmedLeader;
+        }
+
+
+        synchronized JoinGroupResponse join(String group, String consumer, String topic, int maxAttempts) {
+            String hint = null;
+            for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+                try {
+                    if (conn == null) conn = open(hint);
+                    JoinGroupResponse r = conn.joinGroup(group, consumer, topic);
+                    if (r.success) {
+                        confirmedLeader = conn.address();
+                        return r;
+                    }
+                    hint = r.leaderHint;
+                    drop();
+                } catch (IOException e) {
+                    hint = null;
+                    drop();
+                }
+                pause(attempt);
+            }
+            return null;
+        }
+
+
+        synchronized GroupHeartbeatResponse heartbeat(String group, String consumer, int generation, int maxAttempts) {
+            String hint = null;
+            for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+                try {
+                    if (conn == null) conn = open(hint);
+                    GroupHeartbeatResponse r = conn.groupHeartbeat(group, consumer, generation);
+                    if (r.errorCode != GroupHeartbeatResponse.ERR_NOT_LEADER) {
+                        confirmedLeader = conn.address();
+                        return r;
+                    }
+                    hint = r.leaderHint;
+                    drop();
+                } catch (IOException e) {
+                    hint = null;
+                    drop();
+                }
+                pause(attempt);
+            }
+            return null;
         }
 
         synchronized OffsetFetchResponse fetchCommitted(String group, String topic, int p, int maxAttempts) {
@@ -284,6 +436,7 @@ public class ConsumerClient {
                         hint = r.leaderHint;
                         drop();
                     }
+
                 } catch (IOException e) {
                     hint = null;
                     drop();
@@ -307,6 +460,7 @@ public class ConsumerClient {
                         hint = r.leaderHint;
                         drop();
                     }
+
                 } catch (IOException e) {
                     hint = null;
                     drop();
@@ -315,6 +469,7 @@ public class ConsumerClient {
             }
             return false;
         }
+
 
         synchronized ListOffsetsResponse listOffsets(String group, String topic, int p) {
             if (confirmedLeader == null || conn == null) {
