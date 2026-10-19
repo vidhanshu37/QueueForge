@@ -18,6 +18,14 @@ public class BrokerServer {
 
     private final Map<String, PeerConn> controlConns = new ConcurrentHashMap<>();
     private final Map<String, PeerConn> dataConns = new ConcurrentHashMap<>();
+    private static final long SESSION_TIMEOUT_MS = 10_000; // member timout duration
+
+    private static class GroupState {
+        int generation = 0;
+        final TreeMap<String, Long> members = new TreeMap<>();
+    }
+
+    private final Map<String, GroupState> consumerGroups = new ConcurrentHashMap<>();
 
     private static class PeerConn {
         final Socket socket;
@@ -109,7 +117,7 @@ public class BrokerServer {
     private static final String OFFSETS_TOPIC = "__consumer_offsets";
     private final Map<String, Long> committedOffsets = new ConcurrentHashMap<>();
     private volatile boolean offsetsReady = false;
-    private final Map<String, LinkedHashMap<String, Long>> consumerGroups = new ConcurrentHashMap<>();
+//    private final Map<String, LinkedHashMap<String, Long>> consumerGroups = new ConcurrentHashMap<>();
 
     private final Map<String, Map<String, Long>> followerOffsets = new ConcurrentHashMap<>();
 
@@ -356,6 +364,10 @@ public class BrokerServer {
                     OffsetFetchRequest req = OffsetFetchRequest.decode(frame.payload());
                     OffsetFetchResponse resp = handleOffsetFetch(req);
                     new Frame(MessageType.OFFSET_FETCH_RESPONSE, resp.encode()).writeTo(out);
+                } else if (frame.type() == MessageType.GROUP_HEARTBEAT) {
+                    GroupHeartbeatRequest req = GroupHeartbeatRequest.decode(frame.payload());
+                    GroupHeartbeatResponse resp = handleGroupHeartbeat(req);
+                    new Frame(MessageType.GROUP_HEARTBEAT_RESPONSE, resp.encode()).writeTo(out);
                 } else {
                     System.out.println("Received unknown message type: " + frame.type());
                 }
@@ -587,6 +599,9 @@ public class BrokerServer {
         followerOffsets.clear();
         downPeers.clear();
         probesQueued.clear();
+        synchronized (this) {
+            consumerGroups.clear();
+        }
     }
 
     private Set<String> isrFor(String key) {
@@ -609,6 +624,25 @@ public class BrokerServer {
         });
     }
 
+    private void expireDeadMembers(String groupId, GroupState g) {
+        long now = System.currentTimeMillis();
+        boolean removed = false;
+        Iterator<Map.Entry<String, Long>> it = g.members.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry<String, Long> e = it.next();
+            if (now - e.getValue() > SESSION_TIMEOUT_MS) {
+                it.remove();
+                removed = true;
+                System.out.println("[GROUP] '" + groupId + "' member " + e.getKey() + " expired (no heartbeat for "
+                        + (now - e.getValue()) + " ms)");
+            }
+        }
+        if (removed) {
+            g.generation++;
+            System.out.println("[GROUP] '" + groupId + "' generation -> " + g.generation + ", members=" + g.members.keySet());
+        }
+    }
+
     private synchronized JoinGroupResponse handleJoinGroup(JoinGroupRequest req) {
         if (raftState.getRole() != RaftState.NodeRole.LEADER) {
             String hint = raftState.getCurrentLeaderId();
@@ -616,10 +650,18 @@ public class BrokerServer {
             return new JoinGroupResponse(false, null, hint);
         }
 
-        LinkedHashMap<String, Long> members = consumerGroups.computeIfAbsent(req.groupId, g -> new LinkedHashMap<>());
-        members.put(req.consumerId, System.currentTimeMillis());
+        GroupState g = consumerGroups.computeIfAbsent(req.groupId, k -> new GroupState());
+        expireDeadMembers(req.groupId, g);
 
-        List<String> memberList = new ArrayList<>(members.keySet());
+        boolean isNewMember = !g.members.containsKey(req.consumerId);
+        g.members.put(req.consumerId, System.currentTimeMillis());
+        if (isNewMember) {
+            g.generation++;
+            System.out.println("[GROUP] '" + req.groupId + "' generation -> " + g.generation
+                    + ", members=" + g.members.keySet());
+        }
+
+        List<String> memberList = new ArrayList<>(g.members.keySet());
         int myIndex = memberList.indexOf(req.consumerId);
         int totalMembers = memberList.size();
 
@@ -631,10 +673,28 @@ public class BrokerServer {
             }
         }
 
-        System.out.println("Group '" + req.groupId + "' now has " + totalMembers + " members. " +
+        System.out.println("Group '" + req.groupId + "' gen " + g.generation + " has " + totalMembers + " members. " +
                 req.consumerId + " assigned partitions: " + assigned);
 
-        return new JoinGroupResponse(true, assigned, null);
+        return new JoinGroupResponse(true, assigned, null, g.generation);
+    }
+
+    private synchronized GroupHeartbeatResponse handleGroupHeartbeat(GroupHeartbeatRequest req) {
+        if (raftState.getRole() != RaftState.NodeRole.LEADER) {
+            return new GroupHeartbeatResponse(GroupHeartbeatResponse.ERR_NOT_LEADER, 0, raftState.getCurrentLeaderId());
+        }
+        GroupState g = consumerGroups.get(req.groupId);
+        if (g != null) {
+            expireDeadMembers(req.groupId, g);
+        }
+        if (g == null || !g.members.containsKey(req.consumerId)) {
+            return new GroupHeartbeatResponse(GroupHeartbeatResponse.ERR_UNKNOWN_MEMBER, g == null ? 0 : g.generation, null);
+        }
+        g.members.put(req.consumerId, System.currentTimeMillis());
+        if (req.generation != g.generation) {
+            return new GroupHeartbeatResponse(GroupHeartbeatResponse.ERR_REBALANCE, g.generation, null);
+        }
+        return new GroupHeartbeatResponse(GroupHeartbeatResponse.ERR_NONE, g.generation, null);
     }
 
     private void onElectionTimeout() {
