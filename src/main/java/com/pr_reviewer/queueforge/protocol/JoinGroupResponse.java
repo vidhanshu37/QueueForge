@@ -8,11 +8,17 @@ public class JoinGroupResponse {
     public final boolean success;
     public final List<Integer> assignedPartitions;
     public final String leaderHint;
+    public final int generation;
 
     public JoinGroupResponse(boolean success, List<Integer> assignedPartitions, String leaderHint) {
+        this(success, assignedPartitions, leaderHint, 0);
+    }
+
+    public JoinGroupResponse(boolean success, List<Integer> assignedPartitions, String leaderHint, int generation) {
         this.success = success;
         this.assignedPartitions = assignedPartitions;
         this.leaderHint = leaderHint;
+        this.generation = generation;
     }
 
     public byte[] encode() throws IOException {
@@ -26,6 +32,7 @@ public class JoinGroupResponse {
             for (int partition : assignedPartitions) {
                 out.writeInt(partition);
             }
+            out.writeInt(generation);
         } else {
             byte[] hintBytes = (leaderHint != null ? leaderHint : "").getBytes("UTF-8");
             out.writeInt(hintBytes.length);
@@ -46,7 +53,8 @@ public class JoinGroupResponse {
             for (int i = 0; i < count; i++) {
                 assignedPartitions.add(in.readInt());
             }
-            return new JoinGroupResponse(true, assignedPartitions, null);
+            int generation = in.readInt();
+            return new JoinGroupResponse(true, assignedPartitions, null, generation);
         } else {
             int hintLen = in.readInt();
             byte[] hintBytes = new byte[hintLen];

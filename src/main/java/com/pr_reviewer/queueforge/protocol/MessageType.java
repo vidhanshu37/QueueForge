@@ -18,7 +18,9 @@ public enum MessageType {
     OFFSET_COMMIT(15),
     OFFSET_COMMIT_RESPONSE(16),
     OFFSET_FETCH(17),
-    OFFSET_FETCH_RESPONSE(18);
+    OFFSET_FETCH_RESPONSE(18),
+    GROUP_HEARTBEAT(19),
+    GROUP_HEARTBEAT_RESPONSE(20);
 
 
     private final int code;
